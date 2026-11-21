@@ -74,11 +74,13 @@ class MotorHead(nn.Module):
         hidden_size: int = 3584,
         bottleneck: int = 512,
         out_dim: int = 6,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.bottleneck = bottleneck
         self.out_dim = out_dim
+        self.dropout_p = float(dropout)
 
         self.net = nn.Sequential(
             nn.Linear(hidden_size, bottleneck),
@@ -96,7 +98,13 @@ class MotorHead(nn.Module):
         if normed_h.ndim == 3:
             normed_h = normed_h[:, -1, :]
         target_dtype = self.net[0].weight.dtype
-        return self.net(normed_h.to(target_dtype))
+        x = normed_h.to(target_dtype)
+        x = self.net[0](x)
+        x = self.net[1](x)
+        x = self.net[2](x)
+        if self.dropout_p > 0.0 and self.training:
+            x = torch.nn.functional.dropout(x, p=self.dropout_p, training=True)
+        return self.net[3](x)
 
     def forward(self, normed_h: torch.Tensor) -> torch.Tensor:
         """Return ``[B, 6]`` tensor with sigmoid applied to ``(x_norm, y_norm)``."""

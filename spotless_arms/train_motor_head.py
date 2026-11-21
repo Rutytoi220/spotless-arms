@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
+import random
 import re
 import subprocess
 import time
@@ -22,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 from spotless_arms.models.latent_core import DEFAULT_MODEL_ID
 from spotless_arms.models.motor_head import (
@@ -37,6 +39,15 @@ TERMINAL_PROMPTS = (
     "do nothing, wait",
     "target already clicked",
 )
+
+
+def _augment_brightness_contrast(img: Image.Image, rng: random.Random) -> Image.Image:
+    """Spatial-safe visual augmentation (brightness/contrast jitter, zero pixel shift)."""
+    b_factor = rng.uniform(0.90, 1.10)
+    c_factor = rng.uniform(0.90, 1.10)
+    out = ImageEnhance.Brightness(img).enhance(b_factor)
+    out = ImageEnhance.Contrast(out).enhance(c_factor)
+    return out
 
 
 def _resize_for_vlm(img: Image.Image, max_width: Optional[int] = 1280) -> Image.Image:
@@ -195,48 +206,111 @@ def collect_distillation_features(
     return torch.cat(features, dim=0), torch.cat(targets, dim=0)
 
 
+def load_demo_records(manifest_path: Path) -> List[Dict[str, Any]]:
+    with manifest_path.open("r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def collect_demo_features(
     vla: SpotlessVLA,
     manifest_path: Path,
     K: int = 4,
+    records: Optional[List[Dict[str, Any]]] = None,
+    oversample: int = 1,
+    seed: int = 42,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extract frozen ``normed_h`` hidden states for every recorded demonstration."""
+    """Extract frozen ``normed_h`` hidden states for recorded demonstrations.
+
+    When ``oversample > 1``, pass 0 is clean and passes ``1..oversample-1`` apply
+    spatial-safe brightness/contrast jitter (preserving exact normalized coordinates).
+    """
     base_dir = manifest_path.parent
+    recs = records if records is not None else load_demo_records(manifest_path)
+    if not recs:
+        raise RuntimeError(f"No samples found in {manifest_path}")
+
+    rng = random.Random(seed)
     features: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []
 
-    with manifest_path.open("r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    for idx, line in enumerate(lines, start=1):
-        rec = json.loads(line)
+    for idx, rec in enumerate(recs, start=1):
         img_path = base_dir / rec["image"]
-        img = Image.open(img_path).convert("RGB")
-        data = vla.prepare_multimodal_data(img, rec["prompt"])
-        with torch.inference_mode():
-            normed_h, _ = vla.extract_latent_state(data, K=K, return_pkv=False)
-        del data
-
-        h_vec = normed_h.detach().float().cpu().reshape(1, -1)
+        base_img = _resize_for_vlm(Image.open(img_path).convert("RGB"), max_width=1280)
         tgt = torch.tensor(
             [
                 float(rec["x_norm"]),
                 float(rec["y_norm"]),
                 float(rec.get("move", 1.0)),
-                float(rec.get("left_click", 0.0)),
+                float(rec.get("left_click", 1.0)),
                 float(rec.get("right_click", 0.0)),
                 float(rec.get("done", 0.0)),
             ],
             dtype=torch.float32,
         ).unsqueeze(0)
-        features.append(h_vec)
-        targets.append(tgt)
-        print(f"  [demo {idx:03d}/{len(lines)}] {img_path.name} -> ({rec['x_norm']:.3f}, {rec['y_norm']:.3f})")
 
-    if not features:
-        raise RuntimeError(f"No samples found in {manifest_path}")
+        for aug_i in range(max(1, oversample)):
+            img = base_img if aug_i == 0 else _augment_brightness_contrast(base_img, rng)
+            data = vla.prepare_multimodal_data(img, rec["prompt"])
+            with torch.inference_mode():
+                normed_h, _ = vla.extract_latent_state(data, k_steps=K, return_pkv=False)
+            del data
+            features.append(normed_h.detach().float().cpu().reshape(1, -1))
+            targets.append(tgt.clone())
+
+        print(
+            f"  [demo {idx:03d}/{len(recs)}] {img_path.name} -> "
+            f"({rec['x_norm']:.3f}, {rec['y_norm']:.3f}) x{max(1, oversample)}"
+        )
 
     return torch.cat(features, dim=0), torch.cat(targets, dim=0)
+
+
+def evaluate_motor_head(
+    motor_head: MotorHead,
+    val_features: torch.Tensor,
+    val_targets: torch.Tensor,
+    screen_w: int = 3000,
+    screen_h: int = 1920,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """Compute held-out Mean Pixel Error, Hit Rate @35px/@50px, and Halt Accuracy."""
+    motor_head.eval()
+    with torch.no_grad():
+        preds = motor_head(val_features.to(device)).float().cpu()
+
+    tgts = val_targets.float().cpu()
+    active_mask = tgts[:, 5] < 0.5
+    halt_mask = tgts[:, 5] >= 0.5
+
+    px_errors: List[float] = []
+    if active_mask.any():
+        dx = (preds[active_mask, 0] - tgts[active_mask, 0]) * float(screen_w)
+        dy = (preds[active_mask, 1] - tgts[active_mask, 1]) * float(screen_h)
+        dists = torch.sqrt(dx * dx + dy * dy)
+        px_errors = [float(d.item()) for d in dists]
+
+    mean_px_err = sum(px_errors) / len(px_errors) if px_errors else 0.0
+    hit_35 = (sum(1 for d in px_errors if d <= 35.0) / len(px_errors)) if px_errors else 0.0
+    hit_50 = (sum(1 for d in px_errors if d <= 50.0) / len(px_errors)) if px_errors else 0.0
+
+    done_logits = preds[:, 5]
+    pred_halt = done_logits > 0.0
+    halt_correct = (pred_halt == halt_mask).float().mean().item() if len(tgts) > 0 else 0.0
+
+    mean_active_done = float(done_logits[active_mask].mean().item()) if active_mask.any() else 0.0
+    mean_halt_done = float(done_logits[halt_mask].mean().item()) if halt_mask.any() else 0.0
+
+    return {
+        "n_val_total": int(len(tgts)),
+        "n_val_active": int(active_mask.sum().item()),
+        "n_val_halt": int(halt_mask.sum().item()),
+        "mean_px_err": mean_px_err,
+        "hit_rate_35px": hit_35,
+        "hit_rate_50px": hit_50,
+        "halt_accuracy": float(halt_correct),
+        "mean_active_done_logit": mean_active_done,
+        "mean_halt_done_logit": mean_halt_done,
+    }
 
 
 def train_motor_head_from_cache(
@@ -319,33 +393,44 @@ def capture_live_screenshots(out_dir: Path, count: int, interval_s: float = 0.5)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Spotless-Arms MotorHead (<8GB VRAM).")
-    parser.add_argument("--mode", choices=["distill", "demos"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["mixed", "distill", "demos"],
+        default=None,
+        help="Training mode (defaults to 'mixed' when demos/manifest.jsonl exists, else 'distill').",
+    )
     parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--adapter-path", type=str, default=None)
     parser.add_argument("--output", type=Path, default=DEFAULT_MOTOR_HEAD_PATH)
-    parser.add_argument("--images-dir", type=Path, default=None, help="Directory of screenshots for distill mode.")
-    parser.add_argument("--live-capture", type=int, default=0, help="Capture N live Wayland frames if --images-dir is unset (defaults to 24 in distill mode).")
+    parser.add_argument("--images-dir", type=Path, default=None, help="Directory of screenshots for distill/mixed mode.")
+    parser.add_argument("--live-capture", type=int, default=0, help="Capture N live Wayland frames if --images-dir is unset (defaults to 24).")
     parser.add_argument(
         "--prompts",
         type=str,
         nargs="+",
         default=["Click the primary action button on screen."],
     )
-    parser.add_argument("--manifest", type=Path, default=Path("demos/manifest.jsonl"), help="Manifest JSONL for demos mode.")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--manifest", type=Path, default=Path("demos/manifest.jsonl"), help="Manifest JSONL for demos/mixed mode.")
+    parser.add_argument("--demo-oversample", type=int, default=4, help="Spatial-safe oversampling factor for real user demos in mixed mode.")
+    parser.add_argument("--epochs", type=int, default=45)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    if args.mode == "demos" and not args.manifest.is_file():
+    mode = args.mode
+    if mode is None:
+        mode = "mixed" if args.manifest.is_file() else "distill"
+        print(f"[train_motor_head] Auto-selected --mode {mode} (manifest exists={args.manifest.is_file()})")
+
+    if mode in {"demos", "mixed"} and not args.manifest.is_file():
         print(
             f"[train_motor_head] Demo manifest not found at: {args.manifest}\n"
             f"  Record desktop demonstrations first:\n"
             f"    uv run python -m spotless_arms.record_demos --max-samples 30\n"
             f"  Or run self-distillation without manual clicks:\n"
-            f"    uv run python -m spotless_arms.train_motor_head --mode distill --live-capture 32 --epochs 35"
+            f"    uv run python -m spotless_arms.train_motor_head --mode distill --live-capture 24 --epochs 35"
         )
         return
 
@@ -356,7 +441,10 @@ def main() -> None:
         device=args.device,
     )
 
-    if args.mode == "distill":
+    val_features: Optional[torch.Tensor] = None
+    val_targets: Optional[torch.Tensor] = None
+
+    if mode == "distill":
         if args.images_dir is not None:
             image_paths = sorted(
                 p for p in args.images_dir.iterdir()
@@ -368,8 +456,84 @@ def main() -> None:
             image_paths = capture_live_screenshots(Path("distill_frames"), live_count, interval_s=0.15)
 
         features, targets = collect_distillation_features(vla, image_paths, args.prompts, K=args.k)
+    elif mode == "demos":
+        all_recs = load_demo_records(args.manifest)
+        n_val = max(1, int(round(len(all_recs) * 0.2))) if len(all_recs) >= 5 else 0
+        val_set = set(range(1, len(all_recs), max(1, len(all_recs) // max(n_val, 1)))) if n_val > 0 else set()
+        val_set = set(sorted(val_set)[:n_val])
+        train_recs = [r for i, r in enumerate(all_recs) if i not in val_set]
+        val_recs = [r for i, r in enumerate(all_recs) if i in val_set]
+        features, targets = collect_demo_features(
+            vla, args.manifest, K=args.k, records=train_recs, oversample=1
+        )
+        if val_recs:
+            val_features, val_targets = collect_demo_features(
+                vla, args.manifest, K=args.k, records=val_recs, oversample=1
+            )
     else:
-        features, targets = collect_demo_features(vla, args.manifest, K=args.k)
+        # Mixed mode: 4x oversampled real user demos + teacher-distilled active + terminal halt (done=1)
+        all_recs = load_demo_records(args.manifest)
+        n_val_demos = max(2, int(round(len(all_recs) * 0.2))) if len(all_recs) >= 6 else (1 if len(all_recs) >= 3 else 0)
+        # Deterministic interleaved split so validation spans the full spatial range
+        step = max(1, len(all_recs) // max(n_val_demos, 1)) if n_val_demos > 0 else len(all_recs)
+        val_indices = sorted(range(step // 2, len(all_recs), step))[:n_val_demos] if n_val_demos > 0 else []
+        val_set = set(val_indices)
+        train_recs = [r for i, r in enumerate(all_recs) if i not in val_set]
+        val_recs = [r for i, r in enumerate(all_recs) if i in val_set]
+
+        print(
+            f"[train_motor_head] Mixed mode: {len(train_recs)} train demos (x{args.demo_oversample} aug) "
+            f"+ {len(val_recs)} held-out val demos"
+        )
+        demo_train_x, demo_train_y = collect_demo_features(
+            vla, args.manifest, K=args.k, records=train_recs, oversample=args.demo_oversample
+        )
+        demo_val_x, demo_val_y = (
+            collect_demo_features(vla, args.manifest, K=args.k, records=val_recs, oversample=1)
+            if val_recs
+            else (None, None)
+        )
+
+        if args.images_dir is not None:
+            image_paths = sorted(
+                p for p in args.images_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            )
+        else:
+            live_count = args.live_capture if args.live_capture > 0 else 24
+            print(f"[train_motor_head] Capturing {live_count} live Wayland screenshots for mixed distillation...")
+            image_paths = capture_live_screenshots(Path("distill_frames"), live_count, interval_s=0.15)
+
+        distill_x, distill_y = collect_distillation_features(
+            vla, image_paths, args.prompts, K=args.k, terminal_ratio=0.35
+        )
+        # Hold out 2 terminal (done=1) samples for halt classification validation
+        halt_indices = (distill_y[:, 5] > 0.5).nonzero(as_tuple=True)[0]
+        active_indices = (distill_y[:, 5] < 0.5).nonzero(as_tuple=True)[0]
+        n_val_halt = min(2, max(1, len(halt_indices) // 4)) if len(halt_indices) >= 3 else 0
+        train_halt_idx = halt_indices[n_val_halt:]
+        val_halt_idx = halt_indices[:n_val_halt]
+
+        train_distill_idx = torch.cat([active_indices, train_halt_idx], dim=0)
+        features = torch.cat([demo_train_x, distill_x[train_distill_idx]], dim=0)
+        targets = torch.cat([demo_train_y, distill_y[train_distill_idx]], dim=0)
+
+        val_x_parts = []
+        val_y_parts = []
+        if demo_val_x is not None and demo_val_y is not None:
+            val_x_parts.append(demo_val_x)
+            val_y_parts.append(demo_val_y)
+        if len(val_halt_idx) > 0:
+            val_x_parts.append(distill_x[val_halt_idx])
+            val_y_parts.append(distill_y[val_halt_idx])
+        if val_x_parts:
+            val_features = torch.cat(val_x_parts, dim=0)
+            val_targets = torch.cat(val_y_parts, dim=0)
+
+        print(
+            f"[train_motor_head] Mixed train set: {len(features)} samples "
+            f"(demos={len(demo_train_x)}, active_distill={len(active_indices)}, halt={len(train_halt_idx)})"
+        )
 
     trained_head = train_motor_head_from_cache(
         motor_head=vla.motor_head,
@@ -380,6 +544,20 @@ def main() -> None:
         lr=args.lr,
         device=args.device,
     )
+
+    if val_features is not None and val_targets is not None:
+        val_metrics = evaluate_motor_head(
+            trained_head, val_features, val_targets, screen_w=3000, screen_h=1920, device=args.device
+        )
+        print(
+            f"[train_motor_head] HELD-OUT VALIDATION (3000x1920): "
+            f"mean_px_err={val_metrics['mean_px_err']:.1f}px | "
+            f"hit@35px={val_metrics['hit_rate_35px']*100:.1f}% | "
+            f"hit@50px={val_metrics['hit_rate_50px']*100:.1f}% | "
+            f"halt_acc={val_metrics['halt_accuracy']*100:.1f}% | "
+            f"active_done={val_metrics['mean_active_done_logit']:+.2f} | "
+            f"halt_done={val_metrics['mean_halt_done_logit']:+.2f}"
+        )
 
     # Sanity-check learned active vs terminal (done=1) predictions
     with torch.no_grad():
