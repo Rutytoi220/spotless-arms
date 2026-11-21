@@ -247,18 +247,24 @@ class SpotlessVLA(nn.Module):
         )
         print(f"[SpotlessVLA] Loaded K=4 adapter from: {resolved_adapter}")
 
-        motor_head = MotorHead(hidden_size=3584, bottleneck=512, out_dim=6).to(
-            device=device,
-            dtype=dtype,
-        )
         resolved_mh = resolve_motor_head_path(motor_head_path)
 
         if resolved_mh is not None:
             sd = torch.load(resolved_mh, map_location="cpu", weights_only=True)
+            inferred_bottleneck = int(sd["net.0.weight"].shape[0]) if "net.0.weight" in sd else 512
+            motor_head = MotorHead(
+                hidden_size=3584, bottleneck=inferred_bottleneck, out_dim=6
+            ).to(device=device, dtype=dtype)
             motor_head.load_state_dict(sd, strict=True)
             motor_head = motor_head.to(device=device, dtype=dtype)
-            print(f"[SpotlessVLA] Loaded MotorHead from: {resolved_mh}")
+            print(
+                f"[SpotlessVLA] Loaded MotorHead (bottleneck={inferred_bottleneck}) from: {resolved_mh}"
+            )
         else:
+            motor_head = MotorHead(hidden_size=3584, bottleneck=512, out_dim=6).to(
+                device=device,
+                dtype=dtype,
+            )
             print("[SpotlessVLA] Using freshly initialized MotorHead (no checkpoint loaded).")
 
         model = cls(base_vlm=base_vlm, adapter=adapter, motor_head=motor_head, processor=processor)
