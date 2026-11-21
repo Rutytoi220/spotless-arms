@@ -1,0 +1,31 @@
+[project]
+name = "spotless-arms"
+version = "0.1.0"
+description = "Pipelined Vision-Language-Action (VLA) Engine with K=4 Spotless Latent Adapter and Direct Kernel Motor Control"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.16.0",
+    "bitsandbytes>=0.50.2",
+    "einops>=0.8.2",
+    "evdev>=2.0.0",
+    "numpy>=2.4.6",
+    "pillow>=13.0.0",
+    "sentencepiece>=0.2.3",
+    "timm>=1.0.31",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "transformers>=4.45.0,<5.0.0",
+]
+
+[project.scripts]
+spotless-arms-benchmark = "spotless_arms.benchmark:main"
+spotless-arms-train = "spotless_arms.train_motor_head:main"
+spotless-arms-record = "spotless_arms.record_demos:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["spotless_arms*"]

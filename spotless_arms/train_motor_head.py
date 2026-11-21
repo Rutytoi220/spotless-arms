@@ -1,0 +1,412 @@
+"""Fast <8GB VRAM Distillation & Demonstration Trainer for Spotless-Arms MotorHead.
+
+Freezes vpm, resampler, Qwen2Model, and the K=4 SpotlessLatentAdapter, training ONLY
+the ~1.84M-parameter MotorHead via SmoothL1 (x, y) + BCEWithLogitsLoss (move, clicks, done).
+
+Supports two modes:
+  1. ``distill``: Teacher Distillation from existing JSON outputs of ``best_vlm_adapter.pt``.
+  2. ``demos``:   Supervised fine-tuning on user demonstrations recorded by ``record_demos.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+
+from spotless_arms.models.latent_core import DEFAULT_MODEL_ID
+from spotless_arms.models.motor_head import (
+    DEFAULT_MOTOR_HEAD_PATH,
+    MotorHead,
+    SpotlessVLA,
+    decode_motor_vector,
+)
+
+TERMINAL_PROMPTS = (
+    "task complete, stop",
+    "do nothing, wait",
+    "target already clicked",
+)
+
+
+def _resize_for_vlm(img: Image.Image, max_width: Optional[int] = 1280) -> Image.Image:
+    if max_width is not None and img.width > max_width:
+        scale = max_width / float(img.width)
+        new_h = max(1, int(round(img.height * scale)))
+        return img.resize((max_width, new_h), Image.Resampling.BILINEAR)
+    return img
+
+
+def parse_teacher_json_to_target(
+    teacher_result: Dict[str, Any],
+    coord_scale: float = 1000.0,
+) -> Optional[torch.Tensor]:
+    """Convert teacher JSON ``{"action": "click", "point": [x, y]}`` into 6D supervision target.
+
+    Target format: ``[x_norm, y_norm, move, left_click, right_click, done]``.
+    """
+    action = str(teacher_result.get("action", "unknown")).lower().strip()
+    point = teacher_result.get("point", [0, 0])
+
+    # Fallback: extract embedded JSON object if raw_output has extra wrapper text
+    if action == "unknown" and point == [0, 0]:
+        raw = str(teacher_result.get("raw_output", ""))
+        match = re.search(r"\{[^{}]*\}", raw)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    action = str(parsed.get("action", "unknown")).lower().strip()
+                    if isinstance(parsed.get("point"), list) and len(parsed["point"]) == 2:
+                        point = parsed["point"]
+            except json.JSONDecodeError:
+                pass
+
+    if action == "unknown" and point == [0, 0]:
+        return None
+
+    x_raw, y_raw = float(point[0]), float(point[1])
+    if x_raw > 1.0 or y_raw > 1.0:
+        x_norm = max(0.0, min(1.0, x_raw / coord_scale))
+        y_norm = max(0.0, min(1.0, y_raw / coord_scale))
+    else:
+        x_norm = max(0.0, min(1.0, x_raw))
+        y_norm = max(0.0, min(1.0, y_raw))
+
+    move = 1.0 if action in {"click", "left_click", "right_click", "double_click", "move", "hover"} else 0.0
+    left_click = 1.0 if action in {"click", "left_click", "double_click"} else 0.0
+    right_click = 1.0 if action in {"right_click", "context_click"} else 0.0
+    done = 1.0 if action in {"done", "finish", "complete", "stop"} else 0.0
+
+    return torch.tensor([x_norm, y_norm, move, left_click, right_click, done], dtype=torch.float32)
+
+
+def compute_motor_loss(
+    pred_motor: torch.Tensor,
+    target: torch.Tensor,
+    coord_weight: float = 5.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """SmoothL1 on (x_norm, y_norm) + BCEWithLogitsLoss on (move, left, right, done)."""
+    pred_coords = pred_motor[:, :2].float()
+    pred_logits = pred_motor[:, 2:].float()
+    tgt_coords = target[:, :2].float()
+    tgt_flags = target[:, 2:].float()
+
+    # Mask coordinate loss when target doesn't require movement
+    move_mask = tgt_flags[:, 0:1]
+    if move_mask.sum() > 0:
+        coord_loss = (
+            F.smooth_l1_loss(pred_coords, tgt_coords, reduction="none") * move_mask
+        ).sum() / (move_mask.sum() * 2.0)
+    else:
+        coord_loss = torch.tensor(0.0, device=pred_motor.device)
+
+    flag_loss = F.binary_cross_entropy_with_logits(pred_logits, tgt_flags)
+    total_loss = coord_weight * coord_loss + flag_loss
+    return total_loss, {
+        "total": float(total_loss.item()),
+        "coord": float(coord_loss.item()),
+        "flags": float(flag_loss.item()),
+    }
+
+
+def collect_distillation_features(
+    vla: SpotlessVLA,
+    image_paths: List[Path],
+    prompts: List[str],
+    K: int = 4,
+    coord_scale: float = 1000.0,
+    terminal_ratio: float = 0.25,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract balanced ``(normed_h, target)`` pairs: ~75% active actions + ~25% terminal (done=1).
+
+    Active samples are supervised by the frozen teacher's JSON output (``done=0``).
+    Terminal/no-op samples pair screenshots with halt prompts (``move=0, clicks=0, done=1``)
+    so ``MotorHead`` learns crisp stopping boundaries.
+    """
+    features: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    active_count = 0
+    terminal_count = 0
+
+    total = len(image_paths)
+    n_terminal = max(1, int(round(total * terminal_ratio))) if total >= 2 and terminal_ratio > 0 else 0
+    n_active = total - n_terminal
+
+    # 1. Active samples (75%): teacher JSON distillation
+    for idx, img_path in enumerate(image_paths[:n_active]):
+        img = _resize_for_vlm(Image.open(img_path).convert("RGB"), max_width=1280)
+        for prompt in prompts:
+            res = vla.forward_text(image=img, prompt=prompt, K=K, return_normed_h=True)
+            tgt = parse_teacher_json_to_target(res, coord_scale=coord_scale)
+            if tgt is None:
+                print(
+                    f"  [skip] {img_path.name} | prompt={prompt!r} -> unparseable teacher output: "
+                    f"{res['raw_output']!r}"
+                )
+                continue
+            h_vec = res["normed_h"].detach().float().cpu().reshape(1, -1)
+            features.append(h_vec)
+            targets.append(tgt.unsqueeze(0))
+            active_count += 1
+            print(
+                f"  [active {active_count:03d}/{n_active * len(prompts)}] {img_path.name} -> "
+                f"{res['action']} point={res['point']} ({res['latency_ms']:.0f}ms)"
+            )
+
+    # 2. Terminal / No-Op samples (25%): done=1, move=0, clicks=0
+    if n_terminal > 0:
+        terminal_target = torch.tensor([[0.5, 0.5, 0.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
+        for idx, img_path in enumerate(image_paths[n_active:]):
+            img = _resize_for_vlm(Image.open(img_path).convert("RGB"), max_width=1280)
+            halt_prompt = TERMINAL_PROMPTS[idx % len(TERMINAL_PROMPTS)]
+            t0 = time.perf_counter()
+            data = vla.prepare_multimodal_data(img, halt_prompt)
+            with torch.inference_mode():
+                normed_h, _ = vla.extract_latent_state(data, k_steps=K, return_pkv=False)
+            del data
+            ms = (time.perf_counter() - t0) * 1000.0
+            h_vec = normed_h.detach().float().cpu().reshape(1, -1)
+            features.append(h_vec)
+            targets.append(terminal_target.clone())
+            terminal_count += 1
+            print(
+                f"  [halt   {terminal_count:03d}/{n_terminal}] {img_path.name} -> "
+                f"done=1 prompt={halt_prompt!r} ({ms:.0f}ms)"
+            )
+
+    if not features:
+        raise RuntimeError("No valid distillation samples were generated.")
+
+    print(
+        f"[train_motor_head] Balanced dataset ready: "
+        f"{active_count} active (done=0) + {terminal_count} terminal (done=1) = {len(features)} total."
+    )
+    return torch.cat(features, dim=0), torch.cat(targets, dim=0)
+
+
+def collect_demo_features(
+    vla: SpotlessVLA,
+    manifest_path: Path,
+    K: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract frozen ``normed_h`` hidden states for every recorded demonstration."""
+    base_dir = manifest_path.parent
+    features: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+
+    with manifest_path.open("r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    for idx, line in enumerate(lines, start=1):
+        rec = json.loads(line)
+        img_path = base_dir / rec["image"]
+        img = Image.open(img_path).convert("RGB")
+        data = vla.prepare_multimodal_data(img, rec["prompt"])
+        with torch.inference_mode():
+            normed_h, _ = vla.extract_latent_state(data, K=K, return_pkv=False)
+        del data
+
+        h_vec = normed_h.detach().float().cpu().reshape(1, -1)
+        tgt = torch.tensor(
+            [
+                float(rec["x_norm"]),
+                float(rec["y_norm"]),
+                float(rec.get("move", 1.0)),
+                float(rec.get("left_click", 0.0)),
+                float(rec.get("right_click", 0.0)),
+                float(rec.get("done", 0.0)),
+            ],
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        features.append(h_vec)
+        targets.append(tgt)
+        print(f"  [demo {idx:03d}/{len(lines)}] {img_path.name} -> ({rec['x_norm']:.3f}, {rec['y_norm']:.3f})")
+
+    if not features:
+        raise RuntimeError(f"No samples found in {manifest_path}")
+
+    return torch.cat(features, dim=0), torch.cat(targets, dim=0)
+
+
+def train_motor_head_from_cache(
+    motor_head: MotorHead,
+    features: torch.Tensor,
+    targets: torch.Tensor,
+    epochs: int = 100,
+    batch_size: int = 16,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    device: str = "cuda",
+) -> MotorHead:
+    """Train ONLY the MotorHead (~1.84M params) on cached ``normed_h`` features."""
+    motor_head = motor_head.to(device=device, dtype=torch.float32)
+    motor_head.train()
+    for p in motor_head.parameters():
+        p.requires_grad = True
+
+    n_params = sum(p.numel() for p in motor_head.parameters() if p.requires_grad)
+    print(f"[train_motor_head] Training {n_params:,} MotorHead parameters on {len(features)} samples...")
+
+    optimizer = torch.optim.AdamW(motor_head.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    n = features.shape[0]
+    for epoch in range(1, epochs + 1):
+        perm = torch.randperm(n)
+        epoch_loss = 0.0
+        epoch_coord = 0.0
+        epoch_flags = 0.0
+        steps = 0
+
+        for start in range(0, n, batch_size):
+            idx = perm[start : start + batch_size]
+            xb = features[idx].to(device)
+            yb = targets[idx].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            pred = motor_head(xb)
+            loss, metrics = compute_motor_loss(pred, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(motor_head.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss += metrics["total"]
+            epoch_coord += metrics["coord"]
+            epoch_flags += metrics["flags"]
+            steps += 1
+
+        scheduler.step()
+        if epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs:
+            print(
+                f"  Epoch {epoch:03d}/{epochs:03d} | "
+                f"loss={epoch_loss / steps:.4f} | "
+                f"coord={epoch_coord / steps:.4f} | "
+                f"flags={epoch_flags / steps:.4f}"
+            )
+
+    motor_head.eval()
+    return motor_head
+
+
+def capture_live_screenshots(out_dir: Path, count: int, interval_s: float = 0.5) -> List[Path]:
+    """Helper to capture N live desktop frames via grim for quick self-distillation."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for i in range(count):
+        proc = subprocess.run(
+            ["grim", "-t", "jpeg", "-q", "85", "-"],
+            capture_output=True,
+            check=True,
+        )
+        p = out_dir / f"live_{i:04d}.jpg"
+        p.write_bytes(proc.stdout)
+        paths.append(p)
+        if i + 1 < count:
+            time.sleep(interval_s)
+    return paths
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train Spotless-Arms MotorHead (<8GB VRAM).")
+    parser.add_argument("--mode", choices=["distill", "demos"], required=True)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
+    parser.add_argument("--adapter-path", type=str, default=None)
+    parser.add_argument("--output", type=Path, default=DEFAULT_MOTOR_HEAD_PATH)
+    parser.add_argument("--images-dir", type=Path, default=None, help="Directory of screenshots for distill mode.")
+    parser.add_argument("--live-capture", type=int, default=0, help="Capture N live Wayland frames if --images-dir is unset (defaults to 24 in distill mode).")
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        nargs="+",
+        default=["Click the primary action button on screen."],
+    )
+    parser.add_argument("--manifest", type=Path, default=Path("demos/manifest.jsonl"), help="Manifest JSONL for demos mode.")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--k", type=int, default=4)
+    parser.add_argument("--device", type=str, default="cuda")
+    args = parser.parse_args()
+
+    if args.mode == "demos" and not args.manifest.is_file():
+        print(
+            f"[train_motor_head] Demo manifest not found at: {args.manifest}\n"
+            f"  Record desktop demonstrations first:\n"
+            f"    uv run python -m spotless_arms.record_demos --max-samples 30\n"
+            f"  Or run self-distillation without manual clicks:\n"
+            f"    uv run python -m spotless_arms.train_motor_head --mode distill --live-capture 32 --epochs 35"
+        )
+        return
+
+    vla = SpotlessVLA.from_pretrained(
+        model_id=args.model_id,
+        adapter_path=args.adapter_path,
+        motor_head_path=None,
+        device=args.device,
+    )
+
+    if args.mode == "distill":
+        if args.images_dir is not None:
+            image_paths = sorted(
+                p for p in args.images_dir.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            )
+        else:
+            live_count = args.live_capture if args.live_capture > 0 else 24
+            print(f"[train_motor_head] Capturing {live_count} live Wayland screenshots for distillation...")
+            image_paths = capture_live_screenshots(Path("distill_frames"), live_count, interval_s=0.15)
+
+        features, targets = collect_distillation_features(vla, image_paths, args.prompts, K=args.k)
+    else:
+        features, targets = collect_demo_features(vla, args.manifest, K=args.k)
+
+    trained_head = train_motor_head_from_cache(
+        motor_head=vla.motor_head,
+        features=features,
+        targets=targets,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        device=args.device,
+    )
+
+    # Sanity-check learned active vs terminal (done=1) predictions
+    with torch.no_grad():
+        preds = trained_head(features.to(args.device)).cpu()
+        active_idx = (targets[:, 5] < 0.5).nonzero(as_tuple=True)[0]
+        halt_idx = (targets[:, 5] > 0.5).nonzero(as_tuple=True)[0]
+        if len(active_idx) > 0:
+            a_dec = decode_motor_vector(preds[active_idx[0]])
+            print(
+                f"[train_motor_head] Verify ACTIVE sample -> "
+                f"({a_dec['x_norm']:.3f},{a_dec['y_norm']:.3f}) "
+                f"mv={int(a_dec['should_move'])} lclk={int(a_dec['left_click'])} "
+                f"done_logit={a_dec['done_logit']:+.2f} (p={a_dec['done_prob']:.3f})"
+            )
+        if len(halt_idx) > 0:
+            h_dec = decode_motor_vector(preds[halt_idx[0]])
+            print(
+                f"[train_motor_head] Verify HALT   sample -> "
+                f"({h_dec['x_norm']:.3f},{h_dec['y_norm']:.3f}) "
+                f"mv={int(h_dec['should_move'])} lclk={int(h_dec['left_click'])} "
+                f"done_logit={h_dec['done_logit']:+.2f} (p={h_dec['done_prob']:.3f})"
+            )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(trained_head.to(torch.bfloat16).state_dict(), args.output)
+    print(f"[train_motor_head] Saved MotorHead checkpoint -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()
