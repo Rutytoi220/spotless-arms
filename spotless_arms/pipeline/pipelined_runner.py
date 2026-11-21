@@ -9,6 +9,7 @@ Stage 3 (Kernel uinput):         LinuxVirtualArm executes cursor/click in <1ms a
 from __future__ import annotations
 
 import io
+import math
 import subprocess
 import threading
 import time
@@ -182,6 +183,10 @@ class PipelinedVLARunner:
         k_initial: int = 4,
         k_track: int = 1,
         auto_halt_on_click: bool = True,
+        ema_alpha: float = 0.75,
+        convergence_tol: float = 0.008,
+        convergence_patience: int = 2,
+        halt_on_convergence: bool = False,
         max_slice_nums: int = 1,
     ) -> None:
         self.vla = vla
@@ -190,7 +195,12 @@ class PipelinedVLARunner:
         self.k_initial = K if K is not None else k_initial
         self.k_track = k_track
         self.auto_halt_on_click = auto_halt_on_click
+        self.ema_alpha = float(ema_alpha)
+        self.convergence_tol = float(convergence_tol)
+        self.convergence_patience = int(convergence_patience)
+        self.halt_on_convergence = bool(halt_on_convergence)
         self.max_slice_nums = max_slice_nums
+        self.last_summary: Dict[str, Any] = {}
 
     def run(
         self,
@@ -200,31 +210,26 @@ class PipelinedVLARunner:
         done_logit_threshold: Optional[float] = None,
         move_only: bool = False,
         auto_halt_on_click: Optional[bool] = None,
+        halt_on_convergence: Optional[bool] = None,
         wait_for_fresh_frame: bool = False,
         verbose: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Execute the continuous pipelined reflex loop with Adaptive-K & single-click auto-halt.
-
-        Args:
-            prompt: Natural language goal for the VLA.
-            max_ticks: Maximum number of reflex ticks before halting.
-            threshold: Sigmoid probability threshold for move/click/done.
-            done_logit_threshold: Optional raw-logit halt threshold (e.g. ``0.5``). If None,
-                halts when ``sigmoid(done_logit) >= threshold``.
-            move_only: Safety flag to move cursor without clicking.
-            auto_halt_on_click: Override instance ``auto_halt_on_click``; when True and a click
-                fires (``move_only=False``), immediately halt after executing that single click.
-            wait_for_fresh_frame: If True, waits for ``frame_id > prev_frame_id``; if False,
-                immediately consumes the latest buffer frame with zero wait.
-            verbose: Print per-tick telemetry table.
-        """
+        """Execute the continuous pipelined reflex loop with Adaptive-K, EMA damping & convergence."""
         self.screen_buffer.start()
         self.vla.eval()
 
         halt_on_click = self.auto_halt_on_click if auto_halt_on_click is None else auto_halt_on_click
+        halt_on_conv = self.halt_on_convergence if halt_on_convergence is None else halt_on_convergence
         telemetry: List[Dict[str, Any]] = []
         last_frame_id = 0
         use_cuda = self.vla.device.type == "cuda"
+
+        ema_x: Optional[float] = None
+        ema_y: Optional[float] = None
+        stable_streak = 0
+        converged = False
+        converged_tick: Optional[int] = None
+        jitter_samples: List[float] = []
 
         if verbose:
             print(
@@ -284,9 +289,37 @@ class PipelinedVLARunner:
                 latent_motor_ms = (time.perf_counter() - motor_t0) * 1000.0
                 del data
 
+                # EMA Cursor Smoothing (Tick 1 snaps at alpha=1.0; Ticks 2+ smooth at ema_alpha)
+                mv_cpu = motor_vec.detach().float().cpu().reshape(-1).clone()
+                raw_x = float(mv_cpu[0].clamp(0.0, 1.0).item())
+                raw_y = float(mv_cpu[1].clamp(0.0, 1.0).item())
+                if ema_x is None or ema_y is None:
+                    smooth_x, smooth_y = raw_x, raw_y
+                    delta_norm = 0.0
+                    jitter_px = 0.0
+                else:
+                    smooth_x = self.ema_alpha * raw_x + (1.0 - self.ema_alpha) * ema_x
+                    smooth_y = self.ema_alpha * raw_y + (1.0 - self.ema_alpha) * ema_y
+                    delta_norm = math.hypot(smooth_x - ema_x, smooth_y - ema_y)
+                    jitter_px = math.hypot(
+                        (smooth_x - ema_x) * float(pkt.width),
+                        (smooth_y - ema_y) * float(pkt.height),
+                    )
+                    jitter_samples.append(jitter_px)
+                    if delta_norm <= self.convergence_tol:
+                        stable_streak += 1
+                    else:
+                        stable_streak = 0
+                    if (not converged) and stable_streak >= self.convergence_patience:
+                        converged = True
+                        converged_tick = tick
+                ema_x, ema_y = smooth_x, smooth_y
+                mv_cpu[0] = smooth_x
+                mv_cpu[1] = smooth_y
+
                 # Stage 3: Sub-millisecond kernel actuation
                 act = self.arm.execute_motor_vector(
-                    motor_vec,
+                    mv_cpu.unsqueeze(0),
                     threshold=threshold,
                     move_only=move_only,
                     screen_w=pkt.width,
@@ -314,6 +347,9 @@ class PipelinedVLARunner:
                     "effective_hz": effective_hz,
                     "capture_fps": self.screen_buffer.capture_fps,
                     "vram_gb": vram_gb,
+                    "jitter_px": jitter_px,
+                    "converged": converged,
+                    "converged_tick": converged_tick,
                     "action": act,
                     "halted_reason": None,
                 }
@@ -323,7 +359,7 @@ class PipelinedVLARunner:
                     act_str = (
                         f"({act['x_norm']:.3f},{act['y_norm']:.3f}) "
                         f"mv={int(act['moved'])} clk={act['clicked'] or '-'} "
-                        f"done={act['done_logit']:+.2f}"
+                        f"done={act['done_logit']:+.2f} jit={jitter_px:.1f}px"
                     )
                     print(
                         f"{tick:4d} | {k_steps:1d} | {pkt.frame_id:4d} | {fetch_ms:5.2f}ms | {prep_ms:5.1f}ms | "
@@ -351,4 +387,19 @@ class PipelinedVLARunner:
                         print(f"[PipelinedVLARunner] Halted at tick {tick}: done signal triggered.")
                     break
 
+                if halt_on_conv and converged:
+                    record["halted_reason"] = "converged"
+                    if verbose:
+                        print(
+                            f"[PipelinedVLARunner] Early-halted at tick {tick}: "
+                            f"spatial convergence reached (tol={self.convergence_tol}, patience={self.convergence_patience})."
+                        )
+                    break
+
+        self.last_summary = {
+            "ticks_executed": len(telemetry),
+            "converged": converged,
+            "converged_tick": converged_tick,
+            "jitter_px": (sum(jitter_samples) / len(jitter_samples)) if jitter_samples else 0.0,
+        }
         return telemetry

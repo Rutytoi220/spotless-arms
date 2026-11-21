@@ -264,6 +264,54 @@ class SpotlessArmsTestSuite(unittest.TestCase):
             self.assertAlmostEqual(rec["y_norm"], 0.5, places=4)
             self.assertTrue((out_dir / rec["image"]).is_file())
 
+    def test_ema_damping_and_early_convergence_halt(self) -> None:
+        from unittest.mock import patch
+
+        adapter, _ = load_spotless_adapter(device=self.device, dtype=self.dtype)
+        base_vlm = _DummyVLM().to(device=self.device, dtype=self.dtype)
+        vla = SpotlessVLA(base_vlm=base_vlm, adapter=adapter, processor=_DummyProcessor())
+
+        # Sequence: Tick 1 snaps to (0.2, 0.2); Tick 2 jumps to (0.6, 0.6) -> EMA(0.75) = (0.5, 0.5);
+        # Ticks 3 & 4 stay at (0.501, 0.501) -> within tol=0.008 for patience=2 -> halts at Tick 4!
+        seq = [
+            torch.tensor([[0.200, 0.200, 5.0, -5.0, -5.0, -5.0]]),
+            torch.tensor([[0.600, 0.600, 5.0, -5.0, -5.0, -5.0]]),
+            torch.tensor([[0.501, 0.501, 5.0, -5.0, -5.0, -5.0]]),
+            torch.tensor([[0.501, 0.501, 5.0, -5.0, -5.0, -5.0]]),
+            torch.tensor([[0.501, 0.501, 5.0, -5.0, -5.0, -5.0]]),
+        ]
+        it = iter(seq)
+
+        with AsyncScreenBuffer(jpeg_quality=80) as sb, LinuxVirtualArm(dry_run=True) as arm:
+            runner = PipelinedVLARunner(
+                vla=vla,
+                arm=arm,
+                screen_buffer=sb,
+                k_initial=4,
+                k_track=1,
+                ema_alpha=0.75,
+                convergence_tol=0.008,
+                convergence_patience=2,
+                halt_on_convergence=True,
+            )
+            with patch.object(vla, "forward_motor", side_effect=lambda **kw: next(it)):
+                telemetry = runner.run(
+                    prompt="Track stationary button",
+                    max_ticks=8,
+                    move_only=True,
+                    verbose=False,
+                )
+
+        self.assertEqual(len(telemetry), 4)
+        self.assertAlmostEqual(telemetry[0]["action"]["x_norm"], 0.200, places=3)
+        self.assertAlmostEqual(telemetry[1]["action"]["x_norm"], 0.500, places=3)
+        self.assertTrue(telemetry[-1]["converged"])
+        self.assertEqual(telemetry[-1]["converged_tick"], 4)
+        self.assertEqual(telemetry[-1]["halted_reason"], "converged")
+        self.assertTrue(runner.last_summary["converged"])
+        self.assertEqual(runner.last_summary["converged_tick"], 4)
+        self.assertGreater(runner.last_summary["jitter_px"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
