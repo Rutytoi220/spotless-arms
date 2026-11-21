@@ -312,6 +312,34 @@ class SpotlessArmsTestSuite(unittest.TestCase):
         self.assertEqual(runner.last_summary["converged_tick"], 4)
         self.assertGreater(runner.last_summary["jitter_px"], 0.0)
 
+    def test_uinput_keyboard_and_scroll_primitives(self) -> None:
+        import time
+        from evdev import ecodes
+        from spotless_arms.actuators.uinput_arm import build_uinput_capabilities
+
+        caps = build_uinput_capabilities()
+        self.assertIn(ecodes.EV_REL, caps)
+        self.assertIn(ecodes.REL_WHEEL, caps[ecodes.EV_REL])
+        self.assertIn(ecodes.KEY_ENTER, caps[ecodes.EV_KEY])
+        self.assertIn(ecodes.KEY_ESC, caps[ecodes.EV_KEY])
+        self.assertIn(ecodes.KEY_A, caps[ecodes.EV_KEY])
+
+        # Verify dry_run keyboard & scroll latency < 2ms/keystroke without touching real desktop
+        with LinuxVirtualArm(dry_run=True) as arm:
+            t0 = time.perf_counter()
+            arm.scroll(-3)
+            arm.press_key("enter")
+            arm.press_key("esc")
+            arm.press_key("tab")
+            n = arm.type_text("Hello, Spotless-Arms 2026!", inter_key_delay_ms=1.0)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.assertEqual(n, len("Hello, Spotless-Arms 2026!"))
+            self.assertLess(elapsed_ms / max(n, 1), 2.0)
+
+        # Verify real /dev/uinput device registers extended capabilities cleanly (zero keystrokes emitted)
+        with LinuxVirtualArm(dry_run=False) as live_arm:
+            self.assertEqual(live_arm.backend, "uinput")
+
 
 if __name__ == "__main__":
     unittest.main()
