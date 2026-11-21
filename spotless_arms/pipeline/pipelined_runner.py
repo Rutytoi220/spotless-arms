@@ -34,6 +34,7 @@ class FramePacket:
     height: int
     capture_ms: float
     timestamp: float
+    raw_image: Optional[Image.Image] = None
 
 
 class AsyncScreenBuffer:
@@ -45,11 +46,13 @@ class AsyncScreenBuffer:
         max_width: Optional[int] = 1280,
         resize_max: Optional[Tuple[int, int]] = None,
         grim_bin: str = "grim",
+        keep_raw: bool = False,
     ) -> None:
         self.jpeg_quality = jpeg_quality
         self.max_width = max_width
         self.resize_max = resize_max
         self.grim_bin = grim_bin
+        self.keep_raw = keep_raw
 
         self._lock = threading.Lock()
         self._ready = threading.Event()
@@ -73,6 +76,7 @@ class AsyncScreenBuffer:
         orig_w, orig_h = img.size
         if img.mode != "RGB":
             img = img.convert("RGB")
+        raw_img = img if self.keep_raw else None
         if self.max_width is not None and orig_w > self.max_width:
             scale = self.max_width / float(orig_w)
             new_h = max(1, int(round(orig_h * scale)))
@@ -90,6 +94,7 @@ class AsyncScreenBuffer:
             height=orig_h,
             capture_ms=capture_ms,
             timestamp=now,
+            raw_image=raw_img,
         )
 
     def _worker(self) -> None:
@@ -187,6 +192,7 @@ class PipelinedVLARunner:
         convergence_tol: float = 0.008,
         convergence_patience: int = 2,
         halt_on_convergence: bool = False,
+        foveated: bool = False,
         max_slice_nums: int = 1,
     ) -> None:
         self.vla = vla
@@ -199,6 +205,7 @@ class PipelinedVLARunner:
         self.convergence_tol = float(convergence_tol)
         self.convergence_patience = int(convergence_patience)
         self.halt_on_convergence = bool(halt_on_convergence)
+        self.foveated = bool(foveated)
         self.max_slice_nums = max_slice_nums
         self.last_summary: Dict[str, Any] = {}
 
@@ -239,14 +246,24 @@ class PipelinedVLARunner:
             print("-" * 109)
 
         # Pre-warm chat template cache once per episode
-        self.vla.format_prompt(prompt)
+        self.vla.format_prompt(prompt, num_images=2 if self.foveated else 1)
 
-        def _fetch_and_prep_cpu(min_id: int) -> Tuple[FramePacket, float, Dict[str, Any]]:
+        def _fetch_and_prep_cpu(
+            min_id: int,
+            cursor_pos: Tuple[float, float],
+        ) -> Tuple[FramePacket, float, Dict[str, Any]]:
             pkt_local, fetch_local_ms = self.screen_buffer.get_latest(min_frame_id=min_id)
+            src_img = (
+                pkt_local.raw_image
+                if (self.foveated and pkt_local.raw_image is not None)
+                else pkt_local.image
+            )
             cpu_data = self.vla.prepare_multimodal_data_cpu(
-                pkt_local.image,
+                src_img,
                 prompt,
                 max_slice_nums=self.max_slice_nums,
+                foveated=self.foveated,
+                cursor_pos=cursor_pos,
             )
             return pkt_local, fetch_local_ms, cpu_data
 
@@ -264,7 +281,8 @@ class PipelinedVLARunner:
                     next_future = None
                 else:
                     min_id = (last_frame_id + 1) if wait_for_fresh_frame else 0
-                    pkt, fetch_ms, cpu_data = _fetch_and_prep_cpu(min_id)
+                    cur_pos = (ema_x if ema_x is not None else 0.5, ema_y if ema_y is not None else 0.5)
+                    pkt, fetch_ms, cpu_data = _fetch_and_prep_cpu(min_id, cur_pos)
                 last_frame_id = pkt.frame_id
 
                 # Non-blocking H2D transfer for current tick
@@ -275,7 +293,8 @@ class PipelinedVLARunner:
                 # Launch overlapped fetch + CPU prep for tick t+1 WHILE GPU executes tick t
                 if tick < max_ticks:
                     next_min_id = (last_frame_id + 1) if wait_for_fresh_frame else 0
-                    next_future = prep_pool.submit(_fetch_and_prep_cpu, next_min_id)
+                    next_pos = (ema_x if ema_x is not None else 0.5, ema_y if ema_y is not None else 0.5)
+                    next_future = prep_pool.submit(_fetch_and_prep_cpu, next_min_id, next_pos)
 
                 # Stage 2: Overlapping Adaptive-K Latent + MotorHead single forward pass
                 motor_t0 = time.perf_counter()

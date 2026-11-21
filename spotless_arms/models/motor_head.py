@@ -150,6 +150,47 @@ def decode_motor_vector(motor_vec: torch.Tensor, threshold: float = 0.5) -> Dict
     }
 
 
+class FoveatedCropper:
+    """Dual-view cropper producing an 896px global overview + native 336x336 foveal crop."""
+
+    def __init__(self, global_width: int = 896, crop_size: int = 336) -> None:
+        self.global_width = int(global_width)
+        self.crop_size = int(crop_size)
+
+    def build_views(
+        self,
+        image: Image.Image,
+        cursor_x: float = 0.5,
+        cursor_y: float = 0.5,
+    ) -> Tuple[Image.Image, Image.Image]:
+        """Return ``(global_overview, foveal_crop)`` from a source RGB image."""
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        w, h = image.size
+
+        # 1. Global overview (~896x573 for 3000x1920)
+        if w > self.global_width:
+            scale = self.global_width / float(w)
+            new_h = max(1, int(round(h * scale)))
+            global_view = image.resize((self.global_width, new_h), Image.Resampling.BILINEAR)
+        else:
+            global_view = image
+
+        # 2. Native-resolution 336x336 foveal crop centered on (cursor_x, cursor_y), clamped to bounds
+        cx = int(round(max(0.0, min(1.0, float(cursor_x))) * w))
+        cy = int(round(max(0.0, min(1.0, float(cursor_y))) * h))
+        cw = min(self.crop_size, w)
+        ch = min(self.crop_size, h)
+        x0 = max(0, min(w - cw, cx - cw // 2))
+        y0 = max(0, min(h - ch, cy - ch // 2))
+        foveal_crop = image.crop((x0, y0, x0 + cw, y0 + ch))
+        if foveal_crop.size != (self.crop_size, self.crop_size):
+            foveal_crop = foveal_crop.resize(
+                (self.crop_size, self.crop_size), Image.Resampling.BILINEAR
+            )
+        return global_view, foveal_crop
+
+
 class SpotlessVLA(nn.Module):
     """Dual-mode Vision-Language-Action model built on MiniCPM-V-2_6 + K=4 SpotlessLatentAdapter.
 
@@ -179,7 +220,8 @@ class SpotlessVLA(nn.Module):
 
         embed_weights = self.vlm.llm.model.embed_tokens.weight.data
         self.register_buffer("embed_norm", embed_weights.norm(p=2, dim=-1).mean())
-        self._formatted_prompt_cache: Dict[str, str] = {}
+        self._formatted_prompt_cache: Dict[Tuple[str, int], str] = {}
+        self.foveated_cropper = FoveatedCropper(global_width=896, crop_size=336)
 
     @classmethod
     def from_pretrained(
@@ -227,18 +269,20 @@ class SpotlessVLA(nn.Module):
     def device(self) -> torch.device:
         return next(self.adapter.parameters()).device
 
-    def format_prompt(self, prompt: str) -> str:
-        """Apply and cache the MiniCPM-V-2_6 chat template once per prompt string."""
+    def format_prompt(self, prompt: str, num_images: int = 1) -> str:
+        """Apply and cache the MiniCPM-V-2_6 chat template once per (prompt, num_images)."""
         if self.processor is None:
             raise RuntimeError("SpotlessVLA.processor is required for format_prompt")
-        cached = self._formatted_prompt_cache.get(prompt)
+        key = (prompt, int(num_images))
+        cached = self._formatted_prompt_cache.get(key)
         if cached is not None:
             return cached
-        copy_msgs = [{"role": "user", "content": f"(<image>./</image>)\n{prompt}"}]
+        img_tags = "\n".join("(<image>./</image>)" for _ in range(max(1, int(num_images))))
+        copy_msgs = [{"role": "user", "content": f"{img_tags}\n{prompt}"}]
         formatted = self.processor.tokenizer.apply_chat_template(
             copy_msgs, tokenize=False, add_generation_prompt=True
         )
-        self._formatted_prompt_cache[prompt] = formatted
+        self._formatted_prompt_cache[key] = formatted
         return formatted
 
     def prepare_multimodal_data_cpu(
@@ -246,18 +290,32 @@ class SpotlessVLA(nn.Module):
         image: Image.Image,
         prompt: str,
         max_slice_nums: int = 1,
+        foveated: bool = False,
+        cursor_pos: Tuple[float, float] = (0.5, 0.5),
     ) -> Dict[str, Any]:
-        """Run CPU image slicing + tokenization (safe to overlap on a background thread)."""
+        """Run CPU image slicing + tokenization (safe to overlap on a background thread).
+
+        When ``foveated=True``, builds an 896px global overview + native 336x336 foveal crop
+        centered at ``cursor_pos = (cursor_x, cursor_y)``.
+        """
         if self.processor is None:
             raise RuntimeError("SpotlessVLA.processor is required for prepare_multimodal_data_cpu")
 
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        if foveated:
+            global_view, foveal_crop = self.foveated_cropper.build_views(
+                image, cursor_x=cursor_pos[0], cursor_y=cursor_pos[1]
+            )
+            images = [global_view, foveal_crop]
+            formatted_prompt = self.format_prompt(prompt, num_images=2)
+        else:
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            images = [image]
+            formatted_prompt = self.format_prompt(prompt, num_images=1)
 
-        formatted_prompt = self.format_prompt(prompt)
         inputs = self.processor(
             [formatted_prompt],
-            [[image]],
+            [images],
             max_slice_nums=max_slice_nums,
             return_tensors="pt",
         )
@@ -268,10 +326,16 @@ class SpotlessVLA(nn.Module):
         image: Image.Image,
         prompt: str,
         max_slice_nums: int = 1,
+        foveated: bool = False,
+        cursor_pos: Tuple[float, float] = (0.5, 0.5),
     ) -> Dict[str, Any]:
         """Format image + prompt into MiniCPM-V-2_6 multimodal tensor dict on CUDA."""
         cpu_inputs = self.prepare_multimodal_data_cpu(
-            image, prompt, max_slice_nums=max_slice_nums
+            image,
+            prompt,
+            max_slice_nums=max_slice_nums,
+            foveated=foveated,
+            cursor_pos=cursor_pos,
         )
         return to_device(cpu_inputs, self.device)
 

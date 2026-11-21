@@ -340,6 +340,22 @@ class SpotlessArmsTestSuite(unittest.TestCase):
         with LinuxVirtualArm(dry_run=False) as live_arm:
             self.assertEqual(live_arm.backend, "uinput")
 
+    def test_foveated_cropper_and_dual_view_prep(self) -> None:
+        from spotless_arms.models.motor_head import FoveatedCropper
+
+        cropper = FoveatedCropper(global_width=896, crop_size=336)
+        src = Image.new("RGB", (3000, 1920), color="teal")
+        g_view, f_crop = cropper.build_views(src, cursor_x=0.0, cursor_y=1.0)
+        self.assertEqual(g_view.size, (896, 573))
+        self.assertEqual(f_crop.size, (336, 336))
+
+        adapter, _ = load_spotless_adapter(device=self.device, dtype=self.dtype)
+        base_vlm = _DummyVLM().to(device=self.device, dtype=self.dtype)
+        vla = SpotlessVLA(base_vlm=base_vlm, adapter=adapter, processor=_DummyProcessor())
+        cpu_data = vla.prepare_multimodal_data_cpu(src, "Click icon", foveated=True, cursor_pos=(0.1, 0.2))
+        self.assertIn("input_ids", cpu_data)
+        self.assertIn("pixel_values", cpu_data)
+
 
 if __name__ == "__main__":
     unittest.main()
