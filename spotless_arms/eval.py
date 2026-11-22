@@ -46,7 +46,7 @@ def _percentile(values: List[float], pct: float) -> float:
 def run_eval(
     manifest_path: Path = Path("demos/manifest.jsonl"),
     soak_ticks: int = 50,
-    k_initial: int = 4,
+    k_initial: int = 2,
     k_track: int = 1,
     model_id: str = DEFAULT_MODEL_ID,
     adapter_path: Optional[str] = None,
@@ -224,7 +224,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Spotless-Arms eval harness & 50-tick soak test.")
     parser.add_argument("--manifest", type=Path, default=Path("demos/manifest.jsonl"))
     parser.add_argument("--soak-ticks", type=int, default=50)
-    parser.add_argument("--k-initial", type=int, default=4)
+    parser.add_argument("--k-initial", type=int, default=2)
     parser.add_argument("--k-track", type=int, default=1)
     parser.add_argument("--motor-head-path", type=str, default=_AUTO_MOTOR_HEAD)
     args = parser.parse_args()

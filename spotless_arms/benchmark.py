@@ -23,7 +23,7 @@ def run_benchmark(
     prompt: str = "Click the primary action button on screen.",
     ticks: int = 12,
     baseline_runs: int = 2,
-    k_initial: int = 4,
+    k_initial: int = 2,
     k_track: int = 1,
     move_only: bool = True,
     dry_run_arm: bool = False,
@@ -181,7 +181,7 @@ def main() -> None:
     parser.add_argument("--prompt", type=str, default="Click the primary action button on screen.")
     parser.add_argument("--ticks", type=int, default=12)
     parser.add_argument("--baseline-runs", type=int, default=2)
-    parser.add_argument("--k-initial", type=int, default=4)
+    parser.add_argument("--k-initial", type=int, default=2)
     parser.add_argument("--k-track", type=int, default=1)
     parser.add_argument("--allow-clicks", action="store_true", help="Disable move_only safety flag.")
     parser.add_argument("--dry-run-arm", action="store_true", help="Do not emit real uinput events.")

@@ -185,7 +185,7 @@ class PipelinedVLARunner:
         arm: LinuxVirtualArm,
         screen_buffer: AsyncScreenBuffer,
         K: Optional[int] = None,
-        k_initial: int = 4,
+        k_initial: int = 2,
         k_track: int = 1,
         auto_halt_on_click: bool = True,
         ema_alpha: float = 0.75,

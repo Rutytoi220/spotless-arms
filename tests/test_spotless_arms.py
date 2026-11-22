@@ -137,7 +137,9 @@ class SpotlessArmsTestSuite(unittest.TestCase):
             processor=_DummyProcessor(),
         )
         with AsyncScreenBuffer(jpeg_quality=80) as sb, LinuxVirtualArm(dry_run=False) as arm:
-            runner = PipelinedVLARunner(vla=vla, arm=arm, screen_buffer=sb, k_initial=4, k_track=1)
+            runner = PipelinedVLARunner(vla=vla, arm=arm, screen_buffer=sb)
+            self.assertEqual(runner.k_initial, 2)
+            self.assertEqual(runner.k_track, 1)
             telemetry = runner.run(
                 prompt="Locate window center",
                 max_ticks=4,
@@ -146,8 +148,8 @@ class SpotlessArmsTestSuite(unittest.TestCase):
                 verbose=False,
             )
             self.assertEqual(len(telemetry), 4)
-            # Adaptive-K schedule: Tick 1 uses K=4, Ticks 2+ use K=1
-            self.assertEqual([t["k_steps"] for t in telemetry], [4, 1, 1, 1])
+            # Adaptive-K default schedule: Tick 1 uses K=2, Ticks 2+ use K=1
+            self.assertEqual([t["k_steps"] for t in telemetry], [2, 1, 1, 1])
             # Zero-wait overlapped fetch on subsequent ticks
             self.assertLess(telemetry[-1]["fetch_ms"], 5.0)
             # Sub-millisecond kernel actuation
