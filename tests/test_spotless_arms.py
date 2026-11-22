@@ -391,6 +391,41 @@ class SpotlessArmsTestSuite(unittest.TestCase):
             loss_after, _ = compute_motor_loss(trained.cpu()(feats), tgts)
         self.assertLess(float(loss_after), float(loss_before) * 0.15)
 
+    def test_joint_unfreeze_adapter_grad_flow_and_resolution(self) -> None:
+        from spotless_arms.models.latent_core import resolve_adapter_path
+        from spotless_arms.synthetic_ui import generate_synthetic_ui_samples
+        from spotless_arms.train_motor_head import train_joint_adapter_and_motor_head
+
+        adapter, _ = load_spotless_adapter(device=self.device, dtype=torch.float32, freeze=False)
+        base_vlm = _DummyVLM().to(device=self.device, dtype=torch.float32)
+        for p in base_vlm.parameters():
+            p.requires_grad = False
+        mh = MotorHead(hidden_size=3584, bottleneck=128, out_dim=6, dropout=0.0).to(
+            device=self.device, dtype=torch.float32
+        )
+        vla = SpotlessVLA(base_vlm=base_vlm, adapter=adapter, motor_head=mh, processor=_DummyProcessor())
+
+        ref_before = vla.adapter.refiner[0].weight.detach().clone()
+        verb_before = vla.adapter.verbalizer[0].weight.detach().clone()
+        mh_before = vla.motor_head.net[0].weight.detach().clone()
+
+        tr = generate_synthetic_ui_samples(n_samples=8, seed=11, terminal_ratio=0.25)
+        va = generate_synthetic_ui_samples(n_samples=4, seed=22, terminal_ratio=0.25)
+        res = train_joint_adapter_and_motor_head(
+            vla=vla, train_samples=tr, val_samples=va, epochs=2, grad_accum_steps=4, k_steps=2
+        )
+        self.assertIn("cos_before", res)
+        self.assertIn("cos_after", res)
+        # Verify gradients updated BOTH SpotlessLatentAdapter (refiner + verbalizer) and MotorHead
+        self.assertFalse(torch.allclose(ref_before, vla.adapter.refiner[0].weight.detach()))
+        self.assertFalse(torch.allclose(verb_before, vla.adapter.verbalizer[0].weight.detach()))
+        self.assertFalse(torch.allclose(mh_before, vla.motor_head.net[0].weight.detach()))
+
+        # Verify prefer_motor_adapter resolves cleanly
+        resolved = resolve_adapter_path(prefer_motor_adapter=True)
+        self.assertIsNotNone(resolved)
+        self.assertTrue(resolved.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

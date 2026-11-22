@@ -231,12 +231,13 @@ class SpotlessVLA(nn.Module):
         motor_head_path: Optional[str] = _AUTO_MOTOR_HEAD,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        prefer_motor_adapter: bool = True,
     ) -> "SpotlessVLA":
-        """Load 4-bit MiniCPM-V-2_6, pretrained K=4 adapter, and trained MotorHead weights.
+        """Load 4-bit MiniCPM-V-2_6, SpotlessLatentAdapter, and trained MotorHead weights.
 
-        By default (``motor_head_path=_AUTO_MOTOR_HEAD``), automatically loads
-        ``checkpoints/best_motor_head.pt`` if present. Pass ``motor_head_path=None``
-        to force a freshly initialized ``MotorHead``.
+        When ``adapter_path`` is omitted and ``prefer_motor_adapter=True``, checks
+        ``checkpoints/best_motor_adapter.pt`` first before falling back to
+        ``checkpoints/best_vlm_adapter.pt``.
         """
         base_vlm, processor = load_minicpm_4bit(model_id=model_id, device=device)
         adapter, resolved_adapter = load_spotless_adapter(
@@ -244,6 +245,7 @@ class SpotlessVLA(nn.Module):
             device=device,
             dtype=dtype,
             freeze=True,
+            prefer_motor_adapter=prefer_motor_adapter,
         )
         print(f"[SpotlessVLA] Loaded K=4 adapter from: {resolved_adapter}")
 

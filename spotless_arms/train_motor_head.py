@@ -26,7 +26,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageEnhance
 
-from spotless_arms.models.latent_core import DEFAULT_MODEL_ID
+from spotless_arms.models.latent_core import (
+    DEFAULT_MODEL_ID,
+    DEFAULT_MOTOR_ADAPTER_PATH,
+)
 from spotless_arms.models.motor_head import (
     DEFAULT_MOTOR_HEAD_PATH,
     MotorHead,
@@ -129,6 +132,286 @@ def compute_motor_loss(
         "total": float(total_loss.item()),
         "coord": float(coord_loss.item()),
         "flags": float(flag_loss.item()),
+    }
+
+
+def _mean_pairwise_cosine_similarity(h_matrix: torch.Tensor) -> float:
+    """Compute mean off-diagonal pairwise cosine similarity of ``[N, D]`` hidden states."""
+    if h_matrix.shape[0] < 2:
+        return 1.0
+    h_norm = F.normalize(h_matrix.float(), p=2, dim=-1)
+    sim = h_norm @ h_norm.T
+    n = sim.shape[0]
+    mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+    return float(sim[mask].mean().item())
+
+
+def _clone_kv_to_device(kv_cpu: Any, device: torch.device | str) -> Any:
+    """Reconstruct a fresh DynamicCache (or legacy tuple) on ``device`` without mutating CPU cache."""
+    if isinstance(kv_cpu, tuple) and len(kv_cpu) > 0 and isinstance(kv_cpu[0], tuple):
+        from transformers.cache_utils import DynamicCache
+
+        gpu_legacy = tuple(
+            (k.to(device, non_blocking=True), v.to(device, non_blocking=True))
+            for k, v in kv_cpu
+        )
+        return DynamicCache.from_legacy_cache(gpu_legacy)
+    return kv_cpu
+
+
+def _prefill_cache_samples(
+    vla: SpotlessVLA,
+    samples: List[UISample],
+    label: str = "prefill",
+) -> List[Tuple[torch.Tensor, Any, torch.Tensor]]:
+    """Run vision + multimodal prefill under ``torch.no_grad()`` and cache ``(h0, kv_cpu, target)`` on CPU."""
+    cached: List[Tuple[torch.Tensor, Any, torch.Tensor]] = []
+    t0 = time.perf_counter()
+    use_cuda = vla.device.type == "cuda"
+
+    for idx, s in enumerate(samples, start=1):
+        data = vla.prepare_multimodal_data(s.image, s.prompt)
+        with torch.no_grad():
+            if use_cuda:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    embeds, _ = vla.vlm.get_vllm_embedding(data)
+                    out = vla.vlm.llm.model(inputs_embeds=embeds, use_cache=True)
+            else:
+                embeds, _ = vla.vlm.get_vllm_embedding(data)
+                out = vla.vlm.llm.model(inputs_embeds=embeds, use_cache=True)
+            h0 = out.last_hidden_state[:, -1:, :].detach().cpu()
+            pkv = out.past_key_values
+            if hasattr(pkv, "to_legacy_cache"):
+                kv_cpu: Any = tuple(
+                    (k.detach().cpu(), v.detach().cpu()) for k, v in pkv.to_legacy_cache()
+                )
+            else:
+                kv_cpu = pkv
+        del data, embeds, out, pkv
+        tgt = torch.tensor([s.target_tensor_values()], dtype=torch.float32)
+        cached.append((h0, kv_cpu, tgt))
+
+        if idx == 1 or idx % 40 == 0 or idx == len(samples):
+            print(f"  [{label} {idx:03d}/{len(samples)}] ({time.perf_counter() - t0:.1f}s) cached KV on CPU")
+
+    return cached
+
+
+def _forward_recurrent_from_prefill(
+    vla: SpotlessVLA,
+    h0: torch.Tensor,
+    kv_cpu: Any,
+    k_steps: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run differentiable K-step recurrent adapter + MotorHead from cached prefill ``(h0, kv_cpu)``."""
+    device = vla.device
+    model_dtype = vla.vlm.llm.model.embed_tokens.weight.dtype
+    norm_dtype = vla.vlm.llm.model.norm.weight.dtype
+    use_cuda = device.type == "cuda"
+
+    h = h0.to(device)
+    pkv = _clone_kv_to_device(kv_cpu, device)
+
+    for _ in range(k_steps):
+        h_ref = vla.adapter.refine(h)
+        norm_val = h_ref.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        e_lat = ((h_ref / norm_val) * vla.embed_norm).to(model_dtype)
+        if use_cuda:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = vla.vlm.llm.model(inputs_embeds=e_lat, past_key_values=pkv, use_cache=True)
+        else:
+            out = vla.vlm.llm.model(inputs_embeds=e_lat, past_key_values=pkv, use_cache=True)
+        pkv = out.past_key_values
+        h = out.last_hidden_state[:, -1:, :]
+
+    h_verb = vla.adapter.verbalize(h)
+    normed_h = vla.vlm.llm.model.norm(h_verb.to(norm_dtype))
+    pred = vla.motor_head(normed_h)
+    return pred, normed_h
+
+
+def _eval_joint_cached(
+    vla: SpotlessVLA,
+    val_cached: List[Tuple[torch.Tensor, Any, torch.Tensor]],
+    k_steps: int = 2,
+    screen_w: int = 3000,
+    screen_h: int = 1920,
+) -> Tuple[Dict[str, float], float]:
+    """Evaluate joint adapter+MotorHead on cached prefill val set and return ``(metrics, cos_sim)``."""
+    vla.adapter.eval()
+    vla.motor_head.eval()
+    preds_list: List[torch.Tensor] = []
+    tgts_list: List[torch.Tensor] = []
+    hs_list: List[torch.Tensor] = []
+
+    with torch.no_grad():
+        for h0, kv_cpu, tgt in val_cached:
+            pred, nh = _forward_recurrent_from_prefill(vla, h0, kv_cpu, k_steps=k_steps)
+            preds_list.append(pred.float().cpu())
+            tgts_list.append(tgt.float().cpu())
+            hs_list.append(nh.float().cpu().reshape(1, -1))
+
+    preds = torch.cat(preds_list, dim=0)
+    tgts = torch.cat(tgts_list, dim=0)
+    hs = torch.cat(hs_list, dim=0)
+
+    active_mask = tgts[:, 5] < 0.5
+    halt_mask = tgts[:, 5] >= 0.5
+    cos_sim = _mean_pairwise_cosine_similarity(hs[active_mask] if active_mask.sum() >= 2 else hs)
+
+    px_errors: List[float] = []
+    if active_mask.any():
+        dx = (preds[active_mask, 0] - tgts[active_mask, 0]) * float(screen_w)
+        dy = (preds[active_mask, 1] - tgts[active_mask, 1]) * float(screen_h)
+        dists = torch.sqrt(dx * dx + dy * dy)
+        px_errors = [float(d.item()) for d in dists]
+
+    mean_px_err = sum(px_errors) / len(px_errors) if px_errors else 0.0
+    hit_35 = (sum(1 for d in px_errors if d <= 35.0) / len(px_errors)) if px_errors else 0.0
+    hit_50 = (sum(1 for d in px_errors if d <= 50.0) / len(px_errors)) if px_errors else 0.0
+    done_logits = preds[:, 5]
+    halt_acc = float(((done_logits > 0.0) == halt_mask).float().mean().item()) if len(tgts) > 0 else 0.0
+    mean_active_done = float(done_logits[active_mask].mean().item()) if active_mask.any() else 0.0
+    mean_halt_done = float(done_logits[halt_mask].mean().item()) if halt_mask.any() else 0.0
+
+    return (
+        {
+            "n_val_total": int(len(tgts)),
+            "n_val_active": int(active_mask.sum().item()),
+            "n_val_halt": int(halt_mask.sum().item()),
+            "mean_px_err": mean_px_err,
+            "hit_rate_35px": hit_35,
+            "hit_rate_50px": hit_50,
+            "halt_accuracy": halt_acc,
+            "mean_active_done_logit": mean_active_done,
+            "mean_halt_done_logit": mean_halt_done,
+        },
+        cos_sim,
+    )
+
+
+def train_joint_adapter_and_motor_head(
+    vla: SpotlessVLA,
+    train_samples: List[UISample],
+    val_samples: List[UISample],
+    epochs: int = 25,
+    grad_accum_steps: int = 8,
+    adapter_lr: float = 1e-4,
+    motor_lr: float = 5e-4,
+    k_steps: int = 2,
+    weight_decay: float = 1e-4,
+) -> Dict[str, Any]:
+    """Jointly train ``SpotlessLatentAdapter`` + ``MotorHead`` while keeping VLM backbone frozen.
+
+    Prefill runs once under ``torch.no_grad()`` and caches KV on CPU, keeping peak CUDA VRAM < 7.20 GB.
+    """
+    import copy
+
+    device = vla.device
+    for p in vla.vlm.parameters():
+        p.requires_grad = False
+    vla.vlm.eval()
+
+    # Train adapter & motor_head in fp32 for clean AdamW precision
+    vla.adapter = vla.adapter.to(device=device, dtype=torch.float32)
+    vla.motor_head = vla.motor_head.to(device=device, dtype=torch.float32)
+    for p in vla.adapter.parameters():
+        p.requires_grad = True
+    for p in vla.motor_head.parameters():
+        p.requires_grad = True
+
+    adapter_params = list(vla.adapter.parameters())
+    motor_params = list(vla.motor_head.parameters())
+    total_trainable = sum(p.numel() for p in adapter_params + motor_params)
+    print(
+        f"[train_joint] Caching prefill KV under torch.no_grad() "
+        f"(trainable={total_trainable:,}, k_steps={k_steps}, adapter_lr={adapter_lr}, motor_lr={motor_lr})..."
+    )
+
+    train_cached = _prefill_cache_samples(vla, train_samples, label="prefill-train")
+    val_cached = _prefill_cache_samples(vla, val_samples, label="prefill-val")
+
+    before_metrics, cos_before = _eval_joint_cached(vla, val_cached, k_steps=k_steps)
+    print(
+        f"[train_joint] BEFORE training -> val_px={before_metrics['mean_px_err']:.1f}px | "
+        f"hit@35px={before_metrics['hit_rate_35px']*100:.1f}% | "
+        f"halt={before_metrics['halt_accuracy']*100:.1f}% | "
+        f"normed_h pairwise_cos_sim={cos_before:.4f}"
+    )
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": adapter_params, "lr": adapter_lr, "weight_decay": weight_decay},
+            {"params": motor_params, "lr": motor_lr, "weight_decay": weight_decay},
+        ]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    best_score: Optional[Tuple[float, float]] = None
+    best_adapter_sd: Optional[Dict[str, torch.Tensor]] = None
+    best_motor_sd: Optional[Dict[str, torch.Tensor]] = None
+    best_val_metrics = before_metrics
+    best_cos_after = cos_before
+
+    n = len(train_cached)
+    for epoch in range(1, epochs + 1):
+        ep_t0 = time.perf_counter()
+        vla.adapter.train()
+        vla.motor_head.train()
+        perm = torch.randperm(n).tolist()
+
+        optimizer.zero_grad(set_to_none=True)
+        ep_loss = 0.0
+        ep_coord = 0.0
+        ep_flags = 0.0
+
+        for step_idx, sample_i in enumerate(perm, start=1):
+            h0, kv_cpu, tgt = train_cached[sample_i]
+            pred, _ = _forward_recurrent_from_prefill(vla, h0, kv_cpu, k_steps=k_steps)
+            loss, m = compute_motor_loss(
+                pred, tgt.to(device), coord_weight=25.0, smooth_l1_beta=0.015
+            )
+            (loss / float(grad_accum_steps)).backward()
+
+            ep_loss += m["total"]
+            ep_coord += m["coord"]
+            ep_flags += m["flags"]
+
+            if step_idx % grad_accum_steps == 0 or step_idx == n:
+                torch.nn.utils.clip_grad_norm_(adapter_params + motor_params, max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        scheduler.step()
+        val_m, cos_now = _eval_joint_cached(vla, val_cached, k_steps=k_steps)
+        score = (val_m["halt_accuracy"], -val_m["mean_px_err"])
+        if best_score is None or score > best_score:
+            best_score = score
+            best_val_metrics = val_m
+            best_cos_after = cos_now
+            best_adapter_sd = copy.deepcopy(vla.adapter.state_dict())
+            best_motor_sd = copy.deepcopy(vla.motor_head.state_dict())
+
+        vram_gb = torch.cuda.max_memory_allocated() / (1024**3) if device.type == "cuda" else 0.0
+        if epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs:
+            print(
+                f"  Epoch {epoch:03d}/{epochs:03d} ({time.perf_counter() - ep_t0:4.1f}s) | "
+                f"loss={ep_loss / n:.4f} coord={ep_coord / n:.4f} flags={ep_flags / n:.4f} | "
+                f"val_px={val_m['mean_px_err']:5.1f}px @35={val_m['hit_rate_35px']*100:4.1f}% "
+                f"@50={val_m['hit_rate_50px']*100:4.1f}% halt={val_m['halt_accuracy']*100:5.1f}% "
+                f"cos={cos_now:.4f} vram={vram_gb:.2f}G"
+            )
+
+    if best_adapter_sd is not None and best_motor_sd is not None:
+        vla.adapter.load_state_dict(best_adapter_sd)
+        vla.motor_head.load_state_dict(best_motor_sd)
+
+    vla.adapter.eval()
+    vla.motor_head.eval()
+    return {
+        "cos_before": cos_before,
+        "cos_after": best_cos_after,
+        "val_metrics": best_val_metrics,
     }
 
 
@@ -472,7 +755,16 @@ def main() -> None:
     parser.add_argument("--ignore-ambiguous-demos", action="store_true", help="Ignore demos/manifest.jsonl and use --mode auto.")
     parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--adapter-path", type=str, default=None)
+    parser.add_argument("--adapter-output", type=Path, default=DEFAULT_MOTOR_ADAPTER_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_MOTOR_HEAD_PATH)
+    parser.add_argument(
+        "--unfreeze-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Jointly fine-tune SpotlessLatentAdapter + MotorHead (enabled by default in --mode auto).",
+    )
+    parser.add_argument("--adapter-lr", type=float, default=1e-4, help="Learning rate for SpotlessLatentAdapter when unfrozen.")
+    parser.add_argument("--k-train", type=int, default=2, help="Recurrent K steps during joint adapter training.")
     parser.add_argument("--images-dir", type=Path, default=None, help="Directory of screenshots for distill/mixed mode.")
     parser.add_argument("--live-capture", type=int, default=0, help="Capture N live Wayland frames if --images-dir is unset (defaults to 24).")
     parser.add_argument("--synthetic-samples", type=int, default=180, help="Procedural UI train samples for --mode auto.")
@@ -513,11 +805,13 @@ def main() -> None:
         )
         return
 
+    # Always initialize training from the original VLM adapter (never overwrite best_vlm_adapter.pt)
     vla = SpotlessVLA.from_pretrained(
         model_id=args.model_id,
         adapter_path=args.adapter_path,
         motor_head_path=None,
         device=args.device,
+        prefer_motor_adapter=False,
     )
     vla.motor_head = MotorHead(
         hidden_size=3584,
@@ -526,19 +820,22 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device=args.device, dtype=torch.float32)
 
+    unfreeze_adapter = (mode == "auto") if args.unfreeze_adapter is None else bool(args.unfreeze_adapter)
     val_features: Optional[torch.Tensor] = None
     val_targets: Optional[torch.Tensor] = None
 
     if mode == "auto":
+        hypr_count = args.live_capture if args.live_capture > 0 else args.hyprland_frames
         print(
-            f"[train_motor_head] Zero-click AUTO mode: {args.synthetic_samples} synthetic UI (seed=42) "
-            f"+ {args.hyprland_frames} live Hyprland frames | {args.val_synthetic_samples} unseen val (seed=999)"
+            f"[train_motor_head] Zero-click AUTO mode (unfreeze_adapter={unfreeze_adapter}): "
+            f"{args.synthetic_samples} synthetic UI (seed=42) + {hypr_count} live Hyprland frames "
+            f"| {args.val_synthetic_samples} unseen val (seed=999)"
         )
         train_ui = generate_synthetic_ui_samples(
             n_samples=args.synthetic_samples, seed=42, terminal_ratio=0.25
         )
         hypr_samples = harvest_hyprland_samples(
-            n_frames=args.hyprland_frames, max_width=1280, terminal_ratio=0.25
+            n_frames=hypr_count, max_width=1280, terminal_ratio=0.25
         )
         if hypr_samples:
             print(f"[train_motor_head] Harvested {len(hypr_samples)} live Hyprland compositor-grounded samples.")
@@ -549,6 +846,39 @@ def main() -> None:
         val_samples = generate_synthetic_ui_samples(
             n_samples=args.val_synthetic_samples, seed=999, terminal_ratio=0.25
         )
+
+        if unfreeze_adapter:
+            joint_res = train_joint_adapter_and_motor_head(
+                vla=vla,
+                train_samples=all_train_samples,
+                val_samples=val_samples,
+                epochs=args.epochs,
+                grad_accum_steps=8,
+                adapter_lr=args.adapter_lr,
+                motor_lr=args.lr,
+                k_steps=args.k_train,
+            )
+            vm = joint_res["val_metrics"]
+            print(
+                f"[train_motor_head] JOINT HELD-OUT VALIDATION (3000x1920): "
+                f"mean_px_err={vm['mean_px_err']:.1f}px | "
+                f"hit@35px={vm['hit_rate_35px']*100:.1f}% | "
+                f"hit@50px={vm['hit_rate_50px']*100:.1f}% | "
+                f"halt_acc={vm['halt_accuracy']*100:.1f}% | "
+                f"active_done={vm['mean_active_done_logit']:+.2f} | "
+                f"halt_done={vm['mean_halt_done_logit']:+.2f}"
+            )
+            print(
+                f"[train_motor_head] COSINE SIMILARITY (normed_h): "
+                f"before={joint_res['cos_before']:.4f} -> after={joint_res['cos_after']:.4f}"
+            )
+            args.adapter_output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(vla.adapter.to(torch.bfloat16).state_dict(), args.adapter_output)
+            torch.save(vla.motor_head.to(torch.bfloat16).state_dict(), args.output)
+            print(f"[train_motor_head] Saved motor adapter -> {args.adapter_output}")
+            print(f"[train_motor_head] Saved MotorHead checkpoint -> {args.output}")
+            return
 
         features, targets = extract_features_from_ui_samples(
             vla, all_train_samples, K=args.k, label="auto-train"

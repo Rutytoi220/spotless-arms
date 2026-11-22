@@ -29,13 +29,14 @@ Stage 3 (Kernel Actuator)     LinuxVirtualArm: persistent evdev.UInput absolute 
 
 | Metric | Value |
 | :--- | :---: |
-| **Steady-State Tracking ($K=1$)** | **`269.6 ms` (`3.71 Hz`)** |
-| **Tick 1 Deliberation ($K=4$)** | **`352.9 ms` (`2.83 Hz`)** |
+| **Unseen UI Grounding (`seed=999`, Joint Adapter)** | **`42.69 px` mean error (`72.7% @50px`, `39.4% @35px`)** |
+| **Stop-Boundary Classification (`done_logit`)** | **`100.0%`** (`-6.80` active vs `+5.02` halt) |
+| **Steady-State Tracking ($K=1$)** | **`272.75 ms` (`3.67 Hz`, `P95=275.66 ms`)** |
+| **Tick 1 Deliberation ($K=2$ / $K=4$)** | **`302.54 ms` / `349.95 ms`** |
 | **Overlapped Frame Fetch Wait** | **`0.01 ms`** (`11+ FPS` background grabber) |
 | **Overlapped CPU `Prep` (steady-state)** | **`0.4–0.8 ms`** |
-| **Kernel `/dev/uinput` Actuation** | **`0.26 ms`** |
-| **Speedup vs `1325.2 ms` JSON Baseline** | **`4.92x`** |
-| **VRAM Usage (Steady / Peak)** | **`5.45 GB` / `6.55 GB`** (`< 7.20 GB` budget) |
+| **Kernel `/dev/uinput` Actuation** | **`0.09–0.26 ms`** |
+| **50-Tick Soak VRAM Drift (Tick 5 $\rightarrow$ 50)** | **`0.0000 GB`** (`5.45 GB` steady / `6.55 GB` peak, `< 7.20 GB` budget) |
 
 ---
 
@@ -54,21 +55,22 @@ uv run hf auth login
 
 ### 3. Place Checkpoints (Local Only — Ignored by Git)
 Place pretrained weights in `./checkpoints/`:
-- `checkpoints/best_vlm_adapter.pt`
-- `checkpoints/best_motor_head.pt` (auto-loaded by `SpotlessVLA.from_pretrained()`)
+- `checkpoints/best_vlm_adapter.pt` (preserved original VLM adapter)
+- `checkpoints/best_motor_adapter.pt` (jointly fine-tuned motor adapter, auto-loaded first by `SpotlessVLA.from_pretrained()`)
+- `checkpoints/best_motor_head.pt` (auto-loaded with inferred bottleneck width)
 
 ### 4. Run Live Wayland Benchmark (`move_only=True` Safety Default)
 ```bash
-uv run python -m spotless_arms.benchmark --ticks 8
+uv run python -m spotless_arms.benchmark --ticks 10
 ```
 
-### 5. Zero-Click Self-Supervised Training (`--mode auto`) & Eval
+### 5. Zero-Click Joint Adapter + MotorHead Training (`--mode auto --unfreeze-adapter`) & Eval
 ```bash
-# Zero-click training: procedural dark-mode UI + live Hyprland compositor windows + 25% halt
-uv run python -m spotless_arms.train_motor_head --mode auto --synthetic-samples 240 --epochs 200 --lr 1e-3
+# Jointly fine-tune SpotlessLatentAdapter + MotorHead (procedural UI + live Hyprland + 25% halt)
+uv run python -m spotless_arms.train_motor_head --mode auto --unfreeze-adapter --synthetic-samples 240 --live-capture 24 --epochs 25
 
 # Run full eval harness (unseen UI grounding + stop-boundary + 50-tick VRAM/latency soak)
-uv run python -m spotless_arms.eval
+uv run python -m spotless_arms.eval --k-initial 2
 
 # Optional: record manual desktop demonstrations (auto-falls back to Hyprland Hover-Snap Mode)
 uv run python -m spotless_arms.record_demos --max-samples 30

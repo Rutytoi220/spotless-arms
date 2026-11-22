@@ -14,11 +14,17 @@ from transformers import AutoModel, AutoProcessor, BitsAndBytesConfig, PreTraine
 
 DEFAULT_MODEL_ID = "openbmb/MiniCPM-V-2_6"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MOTOR_ADAPTER_PATH = _REPO_ROOT / "checkpoints" / "best_motor_adapter.pt"
 DEFAULT_ADAPTER_CANDIDATES = (
     str(Path("checkpoints") / "best_vlm_adapter.pt"),
     str(_REPO_ROOT / "checkpoints" / "best_vlm_adapter.pt"),
     "/home/rutytoi/Documents/ChienGPT/zelyr/core/vision_engine/best_vlm_adapter.pt",
     "/home/rutytoi/qwen_experiments/checkpoints/best_vlm_adapter.pt",
+)
+DEFAULT_MOTOR_ADAPTER_CANDIDATES = (
+    str(Path("checkpoints") / "best_motor_adapter.pt"),
+    str(DEFAULT_MOTOR_ADAPTER_PATH),
+    *DEFAULT_ADAPTER_CANDIDATES,
 )
 
 
@@ -51,15 +57,24 @@ def apply_transformers_compat_shims() -> None:
     _SHIMS_APPLIED = True
 
 
-def resolve_adapter_path(adapter_path: Optional[str] = None) -> Optional[Path]:
-    """Resolve the best_vlm_adapter.pt checkpoint from explicit arg, env, or known paths."""
+def resolve_adapter_path(
+    adapter_path: Optional[str] = None,
+    prefer_motor_adapter: bool = False,
+) -> Optional[Path]:
+    """Resolve adapter checkpoint.
+
+    When ``prefer_motor_adapter=True``, checks ``checkpoints/best_motor_adapter.pt`` first,
+    falling back to ``checkpoints/best_vlm_adapter.pt``.
+    """
     candidates = []
     if adapter_path:
         candidates.append(adapter_path)
     env_path = os.environ.get("VLM_ADAPTER_PATH")
     if env_path:
         candidates.append(env_path)
-    candidates.extend(DEFAULT_ADAPTER_CANDIDATES)
+    candidates.extend(
+        DEFAULT_MOTOR_ADAPTER_CANDIDATES if prefer_motor_adapter else DEFAULT_ADAPTER_CANDIDATES
+    )
 
     for candidate in candidates:
         p = Path(candidate).expanduser()
@@ -126,10 +141,11 @@ def load_spotless_adapter(
     dtype: torch.dtype = torch.bfloat16,
     freeze: bool = True,
     strict: bool = True,
+    prefer_motor_adapter: bool = False,
 ) -> Tuple[SpotlessLatentAdapter, Optional[Path]]:
     """Instantiate SpotlessLatentAdapter and load pretrained weights if found."""
     adapter = SpotlessLatentAdapter(d=3584, bottleneck=448)
-    resolved = resolve_adapter_path(adapter_path)
+    resolved = resolve_adapter_path(adapter_path, prefer_motor_adapter=prefer_motor_adapter)
     if resolved is not None:
         state_dict = torch.load(resolved, map_location="cpu", weights_only=True)
         adapter.load_state_dict(state_dict, strict=strict)
