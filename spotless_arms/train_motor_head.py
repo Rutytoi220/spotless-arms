@@ -33,11 +33,11 @@ from spotless_arms.models.motor_head import (
     SpotlessVLA,
     decode_motor_vector,
 )
-
-TERMINAL_PROMPTS = (
-    "task complete, stop",
-    "do nothing, wait",
-    "target already clicked",
+from spotless_arms.synthetic_ui import (
+    TERMINAL_PROMPTS,
+    UISample,
+    generate_synthetic_ui_samples,
+    harvest_hyprland_samples,
 )
 
 
@@ -105,9 +105,10 @@ def parse_teacher_json_to_target(
 def compute_motor_loss(
     pred_motor: torch.Tensor,
     target: torch.Tensor,
-    coord_weight: float = 5.0,
+    coord_weight: float = 20.0,
+    smooth_l1_beta: float = 0.02,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """SmoothL1 on (x_norm, y_norm) + BCEWithLogitsLoss on (move, left, right, done)."""
+    """SmoothL1 (beta=0.02) on (x_norm, y_norm) + BCEWithLogitsLoss on (move, left, right, done)."""
     pred_coords = pred_motor[:, :2].float()
     pred_logits = pred_motor[:, 2:].float()
     tgt_coords = target[:, :2].float()
@@ -117,7 +118,7 @@ def compute_motor_loss(
     move_mask = tgt_flags[:, 0:1]
     if move_mask.sum() > 0:
         coord_loss = (
-            F.smooth_l1_loss(pred_coords, tgt_coords, reduction="none") * move_mask
+            F.smooth_l1_loss(pred_coords, tgt_coords, beta=smooth_l1_beta, reduction="none") * move_mask
         ).sum() / (move_mask.sum() * 2.0)
     else:
         coord_loss = torch.tensor(0.0, device=pred_motor.device)
@@ -129,6 +130,42 @@ def compute_motor_loss(
         "coord": float(coord_loss.item()),
         "flags": float(flag_loss.item()),
     }
+
+
+def extract_features_from_ui_samples(
+    vla: SpotlessVLA,
+    samples: List[UISample],
+    K: int = 4,
+    label: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extract frozen ``normed_h`` hidden states for a list of ``UISample`` instances."""
+    features: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    t0 = time.perf_counter()
+
+    for idx, s in enumerate(samples, start=1):
+        data = vla.prepare_multimodal_data(s.image, s.prompt)
+        with torch.inference_mode():
+            if vla.device.type == "cuda":
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    normed_h, _ = vla.extract_latent_state(data, k_steps=K, return_pkv=False)
+            else:
+                normed_h, _ = vla.extract_latent_state(data, k_steps=K, return_pkv=False)
+        del data
+        features.append(normed_h.detach().float().cpu().reshape(1, -1))
+        targets.append(torch.tensor([s.target_tensor_values()], dtype=torch.float32))
+
+        if idx == 1 or idx % 25 == 0 or idx == len(samples):
+            elapsed = time.perf_counter() - t0
+            print(
+                f"  [{label} {idx:03d}/{len(samples)}] ({elapsed:.1f}s) "
+                f"src={s.source} ({s.x_norm:.3f},{s.y_norm:.3f}) done={int(s.done)} prompt={s.prompt!r}"
+            )
+
+    if not features:
+        raise RuntimeError(f"No samples provided to extract_features_from_ui_samples ({label}).")
+
+    return torch.cat(features, dim=0), torch.cat(targets, dim=0)
 
 
 def collect_distillation_features(
@@ -319,11 +356,16 @@ def train_motor_head_from_cache(
     targets: torch.Tensor,
     epochs: int = 100,
     batch_size: int = 16,
-    lr: float = 1e-3,
+    lr: float = 5e-4,
     weight_decay: float = 1e-4,
     device: str = "cuda",
+    val_features: Optional[torch.Tensor] = None,
+    val_targets: Optional[torch.Tensor] = None,
+    scheduler_type: str = "plateau",
 ) -> MotorHead:
-    """Train ONLY the MotorHead (~1.84M params) on cached ``normed_h`` features."""
+    """Train ONLY the MotorHead on cached ``normed_h`` features, keeping best validation weights."""
+    import copy
+
     motor_head = motor_head.to(device=device, dtype=torch.float32)
     motor_head.train()
     for p in motor_head.parameters():
@@ -333,10 +375,19 @@ def train_motor_head_from_cache(
     print(f"[train_motor_head] Training {n_params:,} MotorHead parameters on {len(features)} samples...")
 
     optimizer = torch.optim.AdamW(motor_head.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+    if scheduler_type == "plateau":
+        scheduler: Any = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=6
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    best_val_score: Optional[Tuple[float, float]] = None
+    best_state: Optional[Dict[str, torch.Tensor]] = None
 
     n = features.shape[0]
     for epoch in range(1, epochs + 1):
+        motor_head.train()
         perm = torch.randperm(n)
         epoch_loss = 0.0
         epoch_coord = 0.0
@@ -360,15 +411,34 @@ def train_motor_head_from_cache(
             epoch_flags += metrics["flags"]
             steps += 1
 
-        scheduler.step()
+        avg_loss = epoch_loss / max(steps, 1)
+        if scheduler_type == "plateau":
+            scheduler.step(avg_loss)
+        else:
+            scheduler.step()
+
+        val_str = ""
+        if val_features is not None and val_targets is not None:
+            vm = evaluate_motor_head(motor_head, val_features, val_targets, 3000, 1920, device=device)
+            score = (vm["halt_accuracy"], -vm["mean_px_err"])
+            if best_val_score is None or score > best_val_score:
+                best_val_score = score
+                best_state = copy.deepcopy(motor_head.state_dict())
+            val_str = (
+                f" | val_px={vm['mean_px_err']:.1f}px "
+                f"@35={vm['hit_rate_35px']*100:.0f}% halt={vm['halt_accuracy']*100:.0f}%"
+            )
+
         if epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs:
             print(
                 f"  Epoch {epoch:03d}/{epochs:03d} | "
-                f"loss={epoch_loss / steps:.4f} | "
+                f"loss={avg_loss:.4f} | "
                 f"coord={epoch_coord / steps:.4f} | "
-                f"flags={epoch_flags / steps:.4f}"
+                f"flags={epoch_flags / steps:.4f}{val_str}"
             )
 
+    if best_state is not None:
+        motor_head.load_state_dict(best_state)
     motor_head.eval()
     return motor_head
 
@@ -395,15 +465,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train Spotless-Arms MotorHead (<8GB VRAM).")
     parser.add_argument(
         "--mode",
-        choices=["mixed", "distill", "demos"],
+        choices=["auto", "mixed", "distill", "demos"],
         default=None,
-        help="Training mode (defaults to 'mixed' when demos/manifest.jsonl exists, else 'distill').",
+        help="Training mode (defaults to 'auto' when demos/manifest.jsonl is absent or --ignore-ambiguous-demos is set).",
     )
+    parser.add_argument("--ignore-ambiguous-demos", action="store_true", help="Ignore demos/manifest.jsonl and use --mode auto.")
     parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument("--adapter-path", type=str, default=None)
     parser.add_argument("--output", type=Path, default=DEFAULT_MOTOR_HEAD_PATH)
     parser.add_argument("--images-dir", type=Path, default=None, help="Directory of screenshots for distill/mixed mode.")
     parser.add_argument("--live-capture", type=int, default=0, help="Capture N live Wayland frames if --images-dir is unset (defaults to 24).")
+    parser.add_argument("--synthetic-samples", type=int, default=180, help="Procedural UI train samples for --mode auto.")
+    parser.add_argument("--val-synthetic-samples", type=int, default=44, help="Unseen procedural UI validation samples (seed=999).")
+    parser.add_argument("--hyprland-frames", type=int, default=24, help="Live Hyprland compositor-grounded frames for --mode auto.")
     parser.add_argument(
         "--prompts",
         type=str,
@@ -412,25 +486,30 @@ def main() -> None:
     )
     parser.add_argument("--manifest", type=Path, default=Path("demos/manifest.jsonl"), help="Manifest JSONL for demos/mixed mode.")
     parser.add_argument("--demo-oversample", type=int, default=4, help="Spatial-safe oversampling factor for real user demos in mixed mode.")
-    parser.add_argument("--epochs", type=int, default=45)
+    parser.add_argument("--bottleneck", type=int, default=768, help="MotorHead hidden bottleneck width.")
+    parser.add_argument("--dropout", type=float, default=0.15, help="MotorHead dropout rate.")
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--k", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     mode = args.mode
     if mode is None:
-        mode = "mixed" if args.manifest.is_file() else "distill"
+        if args.ignore_ambiguous_demos or not args.manifest.is_file():
+            mode = "auto"
+        else:
+            mode = "mixed"
         print(f"[train_motor_head] Auto-selected --mode {mode} (manifest exists={args.manifest.is_file()})")
 
     if mode in {"demos", "mixed"} and not args.manifest.is_file():
         print(
             f"[train_motor_head] Demo manifest not found at: {args.manifest}\n"
-            f"  Record desktop demonstrations first:\n"
-            f"    uv run python -m spotless_arms.record_demos --max-samples 30\n"
-            f"  Or run self-distillation without manual clicks:\n"
-            f"    uv run python -m spotless_arms.train_motor_head --mode distill --live-capture 24 --epochs 35"
+            f"  Run zero-click self-supervised UI grounding training:\n"
+            f"    uv run python -m spotless_arms.train_motor_head --mode auto --epochs 50\n"
+            f"  Or record desktop demonstrations first:\n"
+            f"    uv run python -m spotless_arms.record_demos --max-samples 30"
         )
         return
 
@@ -440,11 +519,44 @@ def main() -> None:
         motor_head_path=None,
         device=args.device,
     )
+    vla.motor_head = MotorHead(
+        hidden_size=3584,
+        bottleneck=args.bottleneck,
+        out_dim=6,
+        dropout=args.dropout,
+    ).to(device=args.device, dtype=torch.float32)
 
     val_features: Optional[torch.Tensor] = None
     val_targets: Optional[torch.Tensor] = None
 
-    if mode == "distill":
+    if mode == "auto":
+        print(
+            f"[train_motor_head] Zero-click AUTO mode: {args.synthetic_samples} synthetic UI (seed=42) "
+            f"+ {args.hyprland_frames} live Hyprland frames | {args.val_synthetic_samples} unseen val (seed=999)"
+        )
+        train_ui = generate_synthetic_ui_samples(
+            n_samples=args.synthetic_samples, seed=42, terminal_ratio=0.25
+        )
+        hypr_samples = harvest_hyprland_samples(
+            n_frames=args.hyprland_frames, max_width=1280, terminal_ratio=0.25
+        )
+        if hypr_samples:
+            print(f"[train_motor_head] Harvested {len(hypr_samples)} live Hyprland compositor-grounded samples.")
+        else:
+            print("[train_motor_head] No live Hyprland clients available; proceeding with procedural UI samples.")
+
+        all_train_samples = train_ui + hypr_samples
+        val_samples = generate_synthetic_ui_samples(
+            n_samples=args.val_synthetic_samples, seed=999, terminal_ratio=0.25
+        )
+
+        features, targets = extract_features_from_ui_samples(
+            vla, all_train_samples, K=args.k, label="auto-train"
+        )
+        val_features, val_targets = extract_features_from_ui_samples(
+            vla, val_samples, K=args.k, label="auto-val"
+        )
+    elif mode == "distill":
         if args.images_dir is not None:
             image_paths = sorted(
                 p for p in args.images_dir.iterdir()
@@ -543,6 +655,9 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         device=args.device,
+        val_features=val_features,
+        val_targets=val_targets,
+        scheduler_type="plateau",
     )
 
     if val_features is not None and val_targets is not None:

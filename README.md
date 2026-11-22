@@ -18,8 +18,10 @@ Stage 3 (Kernel Actuator)     LinuxVirtualArm: persistent evdev.UInput absolute 
 - `spotless_arms/models/motor_head.py`: `MotorHead(3584 -> 512 -> 6)` outputting `[x_norm, y_norm, move_logit, left_click_logit, right_click_logit, done_logit]` directly from `RMSNorm(h_verb)`, plus dual-mode `SpotlessVLA` (`forward_motor` & `forward_text`).
 - `spotless_arms/actuators/uinput_arm.py`: Zero-subprocess `LinuxVirtualArm` via `evdev.UInput` (automatic `ydotool` / `dry_run` fallback).
 - `spotless_arms/pipeline/pipelined_runner.py`: Overlapped 3-stage reflex loop with Adaptive-$K$ (`k_initial=4` on Tick 1, `k_track=1` on Ticks 2+) and single-click `auto_halt_on_click`.
-- `spotless_arms/train_motor_head.py`: `<8 GB` VRAM trainer freezing VLM + adapter to train only `MotorHead` (~1.84M params) via balanced 75% active / 25% terminal (`done=1`) self-distillation or recorded desktop demos.
-- `spotless_arms/record_demos.py`: Live desktop demonstration recorder supporting passive `/dev/input/event*` click listening with automatic unprivileged **Hyprland Hover-Snap Mode** (`grim` + `hyprctl cursorpos`).
+- `spotless_arms/synthetic_ui.py`: Zero-click procedural dark-mode UI renderer (`1280x819`, 14 distinct widgets, non-overlapping layouts) + live Hyprland compositor window harvester (`grim` + `hyprctl clients -j`).
+- `spotless_arms/train_motor_head.py`: `<8 GB` VRAM trainer freezing VLM + adapter to train only `MotorHead` (~2.76M params at `bottleneck=768`) via zero-click `--mode auto` (procedural UI + live Hyprland + 25% halt), `--mode mixed`, `--mode distill`, or `--mode demos`.
+- `spotless_arms/eval.py`: Automated evaluation scorecard measuring unseen UI grounding pixel error, `@35px`/`@50px` hit rate, stop-boundary accuracy (`done_logit`), and a 50-tick continuous VRAM/latency soak test.
+- `spotless_arms/record_demos.py`: Optional live desktop demonstration recorder supporting passive `/dev/input/event*` click listening with automatic unprivileged **Hyprland Hover-Snap Mode** (`grim` + `hyprctl cursorpos`).
 
 ---
 
@@ -60,14 +62,17 @@ Place pretrained weights in `./checkpoints/`:
 uv run python -m spotless_arms.benchmark --ticks 8
 ```
 
-### 5. Self-Distill or Fine-Tune `MotorHead` on Your Desktop
+### 5. Zero-Click Self-Supervised Training (`--mode auto`) & Eval
 ```bash
-# Balanced 75% active / 25% halt self-distillation (no manual clicks required)
-uv run python -m spotless_arms.train_motor_head --mode distill --live-capture 32 --epochs 35
+# Zero-click training: procedural dark-mode UI + live Hyprland compositor windows + 25% halt
+uv run python -m spotless_arms.train_motor_head --mode auto --synthetic-samples 240 --epochs 200 --lr 1e-3
 
-# Or record live desktop demonstrations (auto-falls back to Hyprland Hover-Snap Mode)
+# Run full eval harness (unseen UI grounding + stop-boundary + 50-tick VRAM/latency soak)
+uv run python -m spotless_arms.eval
+
+# Optional: record manual desktop demonstrations (auto-falls back to Hyprland Hover-Snap Mode)
 uv run python -m spotless_arms.record_demos --max-samples 30
-uv run python -m spotless_arms.train_motor_head --mode demos --manifest demos/manifest.jsonl
+uv run python -m spotless_arms.train_motor_head --mode mixed --manifest demos/manifest.jsonl
 ```
 
 ### 6. Run Unit & Integration Tests

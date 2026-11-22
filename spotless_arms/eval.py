@@ -23,10 +23,11 @@ from spotless_arms.models.motor_head import (
     decode_motor_vector,
 )
 from spotless_arms.pipeline.pipelined_runner import AsyncScreenBuffer, PipelinedVLARunner
+from spotless_arms.synthetic_ui import TERMINAL_PROMPTS, generate_synthetic_ui_samples
 from spotless_arms.train_motor_head import (
-    TERMINAL_PROMPTS,
     collect_demo_features,
     evaluate_motor_head,
+    extract_features_from_ui_samples,
     load_demo_records,
 )
 
@@ -72,13 +73,22 @@ def run_eval(
 
     scorecard: Dict[str, Any] = {
         "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
+        "synthetic_val_eval": {},
         "demo_eval": {},
         "stop_boundary": {},
         "soak_test": {},
         "passed": True,
     }
 
-    # 1. Held-Out & Full Demo Grounding Accuracy
+    # 1a. Unseen Procedural UI Grounding Validation (seed=999, 44 unseen layouts)
+    print("\n[Eval 1a/4] Evaluating unseen procedural UI grounding (seed=999, 44 layouts)...")
+    val_ui = generate_synthetic_ui_samples(n_samples=44, seed=999, terminal_ratio=0.25)
+    val_ui_x, val_ui_y = extract_features_from_ui_samples(vla, val_ui, K=k_initial, label="eval-val")
+    scorecard["synthetic_val_eval"] = evaluate_motor_head(
+        vla.motor_head, val_ui_x, val_ui_y, screen_w=screen_w, screen_h=screen_h, device=device
+    )
+
+    # 1b. Optional Held-Out & Full Demo Grounding Accuracy (when demos/manifest.jsonl exists)
     if manifest_path.is_file():
         all_recs = load_demo_records(manifest_path)
         n_val = max(2, int(round(len(all_recs) * 0.2))) if len(all_recs) >= 6 else len(all_recs)
@@ -86,7 +96,7 @@ def run_eval(
         val_indices = sorted(range(step // 2, len(all_recs), step))[:n_val]
         val_recs = [all_recs[i] for i in val_indices]
 
-        print(f"\n[Eval 1/3] Evaluating demo grounding ({len(val_recs)} held-out / {len(all_recs)} total demos)...")
+        print(f"\n[Eval 1b/4] Evaluating demo grounding ({len(val_recs)} held-out / {len(all_recs)} total demos)...")
         all_x, all_y = collect_demo_features(vla, manifest_path, K=k_initial, records=all_recs, oversample=1)
         val_x = all_x[val_indices]
         val_y = all_y[val_indices]
@@ -102,7 +112,7 @@ def run_eval(
             "full_manifest": full_metrics,
         }
     else:
-        print(f"\n[Eval 1/3] Skipping demo grounding (manifest not found: {manifest_path})")
+        print(f"\n[Eval 1b/4] Skipping manual demo manifest (not present at {manifest_path})")
 
     # 2. Stop-Boundary Classification + 50-Tick Continuous Pipelined Soak Test (move_only=True)
     with AsyncScreenBuffer(jpeg_quality=80, max_width=1280) as sb, LinuxVirtualArm(dry_run=False) as arm:

@@ -356,6 +356,41 @@ class SpotlessArmsTestSuite(unittest.TestCase):
         self.assertIn("input_ids", cpu_data)
         self.assertIn("pixel_values", cpu_data)
 
+    def test_synthetic_ui_bounds_non_overlap_and_auto_convergence(self) -> None:
+        from spotless_arms.synthetic_ui import _boxes_overlap, generate_synthetic_ui_samples
+
+        samples = generate_synthetic_ui_samples(n_samples=20, seed=123, terminal_ratio=0.25)
+        self.assertEqual(len(samples), 20)
+        n_halt = sum(1 for s in samples if s.done >= 0.5)
+        n_active = sum(1 for s in samples if s.done < 0.5)
+        self.assertEqual(n_halt, 5)
+        self.assertEqual(n_active, 15)
+
+        for s in samples:
+            self.assertEqual(s.image.size, (1280, 819))
+            self.assertTrue(0.0 <= s.x_norm <= 1.0)
+            self.assertTrue(0.0 <= s.y_norm <= 1.0)
+            self.assertIsNotNone(s.bboxes)
+            boxes = s.bboxes or []
+            self.assertGreaterEqual(len(boxes), 4)
+            for i in range(len(boxes)):
+                for j in range(i + 1, len(boxes)):
+                    self.assertFalse(_boxes_overlap(boxes[i], boxes[j], pad=0))
+
+        # Verify auto-mode training pipeline converges cleanly on synthetic features
+        torch.manual_seed(7)
+        feats = torch.randn(20, 3584)
+        tgts = torch.tensor([s.target_tensor_values() for s in samples], dtype=torch.float32)
+        mh = MotorHead(hidden_size=3584, bottleneck=768, out_dim=6, dropout=0.15)
+        with torch.no_grad():
+            loss_before, _ = compute_motor_loss(mh(feats), tgts)
+        trained = train_motor_head_from_cache(
+            mh, feats, tgts, epochs=25, batch_size=8, lr=5e-4, device=self.device
+        )
+        with torch.no_grad():
+            loss_after, _ = compute_motor_loss(trained.cpu()(feats), tgts)
+        self.assertLess(float(loss_after), float(loss_before) * 0.15)
+
 
 if __name__ == "__main__":
     unittest.main()
